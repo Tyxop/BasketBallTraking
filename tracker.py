@@ -9,11 +9,13 @@ Produces a side-by-side annotated output video.
 import cv2
 import numpy as np
 import json
+import sys
 import time
 from pathlib import Path
 from collections import deque
 from dataclasses import dataclass, field
 
+from tqdm import tqdm
 from ultralytics import YOLO
 from deep_sort_realtime.deepsort_tracker import DeepSort
 
@@ -262,7 +264,7 @@ def process(video1: str, video2: str, output: str,
     skip=2 → every other frame (2× faster)
     skip=3 → every 3rd frame, etc.
     """
-    print(f"[INFO] Model: {model_name}  |  Frame skip: {skip}")
+    print(f"[INFO] Model: {model_name}  |  Frame skip: {skip}", flush=True)
     model = YOLO(model_name)
 
     cap1  = cv2.VideoCapture(video1)
@@ -284,13 +286,18 @@ def process(video1: str, video2: str, output: str,
                  cam1_ball=0,   cam2_ball=0,
                  total_frames=0)
 
-    t0 = time.time()
-    idx = 0
-    print(f"[INFO] ~{total} frames to process. This may take a while on CPU.\n")
+    print(f"[INFO] ~{total} frames to process.", flush=True)
+
+    bar = tqdm(
+        total=total,
+        unit="fr",
+        dynamic_ncols=True,
+        file=sys.stderr,
+        bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
+    )
 
     try:
         while True:
-            # Skip frames for speed
             for _ in range(skip - 1):
                 cap1.grab(); cap2.grab()
 
@@ -315,36 +322,33 @@ def process(video1: str, video2: str, output: str,
             p2 = cv2.resize(ann2, (half_w, OUTPUT_H), interpolation=cv2.INTER_LINEAR)
             writer.write(np.hstack([p1, p2]))
 
-            idx += 1
-            if idx % 20 == 0:
-                el  = time.time() - t0
-                spd = idx / el
-                pct = 100 * idx / max(total, 1)
-                eta = (total - idx) / max(spd, 0.01)
-                src1 = i1.get('ball_src','—') or '—'
-                src2 = i2.get('ball_src','—') or '—'
-                print(f"  {pct:5.1f}%  [{idx}/{total}]  {spd:.1f} fr/s  "
-                      f"ETA {eta/60:.1f}min  |  "
-                      f"CAM1 score={i1['score']:4d} ball={src1}  "
-                      f"CAM2 score={i2['score']:4d} ball={src2}  "
-                      f"→ CAM{active}")
+            ball1 = ("BALL:" + i1['ball_src']) if i1['ball_box'] else "no ball"
+            ball2 = ("BALL:" + i2['ball_src']) if i2['ball_box'] else "no ball"
+            bar.set_postfix_str(
+                f"CAM{active} | C1 {i1['score']:3d}({ball1}) "
+                f"C2 {i2['score']:3d}({ball2}) "
+                f"mov={len(i1['moving'])}/{len(i2['moving'])}",
+                refresh=False,
+            )
+            bar.update(1)
 
     except KeyboardInterrupt:
-        print("\n[WARN] Interrupted early — partial output written.")
+        tqdm.write("\n[WARN] Interrupted early — partial output written.")
 
+    bar.close()
     cap1.release(); cap2.release(); writer.release()
 
     T = max(stats['total_frames'], 1)
-    print("\n" + "="*60)
-    print("SUMMARY")
-    print("="*60)
-    print(f"  Frames processed  : {T}")
-    print(f"  CAM 1 active      : {stats['cam1_active']:5d}  ({100*stats['cam1_active']/T:.1f}%)")
-    print(f"  CAM 2 active      : {stats['cam2_active']:5d}  ({100*stats['cam2_active']/T:.1f}%)")
-    print(f"  CAM 1 ball seen   : {stats['cam1_ball']:5d}  ({100*stats['cam1_ball']/T:.1f}%)")
-    print(f"  CAM 2 ball seen   : {stats['cam2_ball']:5d}  ({100*stats['cam2_ball']/T:.1f}%)")
-    print(f"  Output            : {output}")
-    print("="*60)
+    print("\n" + "="*60, flush=True)
+    print("SUMMARY", flush=True)
+    print("="*60, flush=True)
+    print(f"  Frames processed  : {T}", flush=True)
+    print(f"  CAM 1 active      : {stats['cam1_active']:5d}  ({100*stats['cam1_active']/T:.1f}%)", flush=True)
+    print(f"  CAM 2 active      : {stats['cam2_active']:5d}  ({100*stats['cam2_active']/T:.1f}%)", flush=True)
+    print(f"  CAM 1 ball seen   : {stats['cam1_ball']:5d}  ({100*stats['cam1_ball']/T:.1f}%)", flush=True)
+    print(f"  CAM 2 ball seen   : {stats['cam2_ball']:5d}  ({100*stats['cam2_ball']/T:.1f}%)", flush=True)
+    print(f"  Output            : {output}", flush=True)
+    print("="*60, flush=True)
 
     out_path = Path(output)
     out_path.with_suffix(".json").write_text(json.dumps({
