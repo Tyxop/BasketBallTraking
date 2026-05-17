@@ -1,0 +1,20 @@
+# Model weights (large binaries — download automatically on first run)
+*.pt
+*.pth
+*.weights
+
+# Output videos and stats
+output*.mp4
+output*.json
+
+# Input videos (private footage)
+videos/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+
+# macOS
+.DS_Store
