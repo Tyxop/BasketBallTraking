@@ -467,7 +467,7 @@ class AutoAnalyzeThread(QThread):
     # ── per-frame analysis helpers (inlined to avoid cross-file imports) ────────
 
     @staticmethod
-    def _ball_color(frame):
+    def _ball_color(frame, fg_mask=None):
         # Basketball orange: H 8-22 (16°-44°), high saturation + brightness.
         # H<8 catches reds/browns; H>22 catches yellows; S/V<150 catches dull surfaces.
         low  = np.array([8,  150, 150])
@@ -477,6 +477,10 @@ class AutoAnalyzeThread(QThread):
         mask = cv2.inRange(cv2.cvtColor(blur, cv2.COLOR_BGR2HSV), low, high)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((5, 5), np.uint8))
+        # Restrict to moving regions: eliminates static orange floors/scoreboards
+        if fg_mask is not None:
+            mask = cv2.bitwise_and(mask,
+                                   cv2.dilate(fg_mask, np.ones((15, 15), np.uint8)))
         boxes = []
         for cnt in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
             area = cv2.contourArea(cnt)
@@ -585,6 +589,13 @@ class AutoAnalyzeThread(QThread):
             states1: dict = {}
             states2: dict = {}
 
+            # Background subtractors — fixed camera: learn static background,
+            # return foreground mask so ball color search is limited to moving regions.
+            sub1 = cv2.createBackgroundSubtractorMOG2(
+                history=500, varThreshold=48, detectShadows=False)
+            sub2 = cv2.createBackgroundSubtractorMOG2(
+                history=500, varThreshold=48, detectShadows=False)
+
             # ── detección de NVDEC ────────────────────────────────────────────
             use_nvdec = False
             if device == "cuda":
@@ -682,8 +693,14 @@ class AutoAnalyzeThread(QThread):
                 if (len(buf_f1) >= BATCH_P) or (eof and buf_f1):
                     flat = [f for ab in zip(buf_f1, buf_f2) for f in ab]
 
+                    # Background subtraction: sequential (stateful model), fast CPU
+                    fg1 = [sub1.apply(f) for f in buf_f1]
+                    fg2 = [sub2.apply(f) for f in buf_f2]
+                    flat_fg = [fg for pair in zip(fg1, fg2) for fg in pair]
+
                     # _ball_color en paralelo (N_WORKERS cores) solapado con YOLO GPU
-                    ball_futs = [ball_pool.submit(self._ball_color, f) for f in flat]
+                    ball_futs = [ball_pool.submit(self._ball_color, f, fg)
+                                 for f, fg in zip(flat, flat_fg)]
 
                     tg = time.perf_counter()
                     results = model(flat, classes=[0, 32], conf=0.25,
@@ -953,6 +970,9 @@ class BasketballEditor(QMainWindow):
         self._debug_mode   = False
         self._debug_model  = None   # YOLO instance, loaded lazily
         self._dbg_loader   = None
+        self._debug_bg_sub1 = None  # MOG2 background subtractor for cam1
+        self._debug_bg_sub2 = None  # MOG2 background subtractor for cam2
+        self._debug_show_bg = False  # overlay the foreground mask in green
         self.deleted_ranges: list[tuple[float, float]] = []
         self._deleted_history: list = []
         self._current_sel: tuple[float, float] | None = None
@@ -1150,12 +1170,26 @@ class BasketballEditor(QMainWindow):
         self.lbl_debug_status = QLabel("")
         self.lbl_debug_status.setStyleSheet("color:#6fca4f;font-size:11px;")
 
+        self.btn_bg_mask = QPushButton("🎭  BG")
+        self.btn_bg_mask.setCheckable(True)
+        self.btn_bg_mask.setToolTip(
+            "Muestra la máscara de fondo (verde = movimiento detectado)\n"
+            "y usa esa máscara para filtrar la detección de color del balón.\n"
+            "Requiere reproducir desde el inicio para que el modelo aprenda el fondo.")
+        self.btn_bg_mask.clicked.connect(self._toggle_bg_mask)
+        self.btn_bg_mask.setStyleSheet(
+            _btn("#1a1a2a", "#5050a0", "#22224a") +
+            "QPushButton:checked{background:#5050a0;border:2px solid #8080d0;}")
+        self.btn_bg_mask.setFixedWidth(70)
+        self.btn_bg_mask.setEnabled(False)  # only active when debug is on
+
         row_auto.addWidget(lbl_auto)
         row_auto.addWidget(self.combo_model)
         row_auto.addWidget(self.combo_skip)
         row_auto.addWidget(self.btn_auto)
         row_auto.addWidget(self.lbl_auto_status, 1)
         row_auto.addWidget(self.btn_debug)
+        row_auto.addWidget(self.btn_bg_mask)
         row_auto.addWidget(self.lbl_debug_status)
         vbox.addLayout(row_auto)
 
@@ -1201,6 +1235,8 @@ class BasketballEditor(QMainWindow):
                   self.btn_preview, self.btn_gen, self.btn_auto,
                   self.btn_sync, self.btn_debug, self.slider):
             w.setEnabled(on)
+        # btn_bg_mask only active while debug is on
+        self.btn_bg_mask.setEnabled(on and self._debug_mode)
 
     # ── loading ───────────────────────────────────────────────────────────────
 
@@ -1322,8 +1358,13 @@ class BasketballEditor(QMainWindow):
 
         # Frames (annotate with YOLO debug overlay if active)
         if self._debug_mode and self._debug_model is not None:
-            f1 = self._annotate_debug(f1)
-            f2 = self._annotate_debug(f2)
+            # Apply bg subtractors sequentially (they are stateful)
+            fg1 = (self._debug_bg_sub1.apply(f1, learningRate=0.005)
+                   if self._debug_bg_sub1 is not None and f1 is not None else None)
+            fg2 = (self._debug_bg_sub2.apply(f2, learningRate=0.005)
+                   if self._debug_bg_sub2 is not None and f2 is not None else None)
+            f1 = self._annotate_debug(f1, fg1)
+            f2 = self._annotate_debug(f2, fg2)
         self.pnl1.show_frame(f1, active == 1)
         self.pnl2.show_frame(f2, active == 2)
 
@@ -1395,13 +1436,19 @@ class BasketballEditor(QMainWindow):
         self._debug_mode = checked
         if not checked:
             self.lbl_debug_status.setText("")
+            self.btn_bg_mask.setEnabled(False)
             self._seek_frame(self.current_frame)
             return
+        # Create background subtractors fresh each time debug is activated
+        self._debug_bg_sub1 = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=48, detectShadows=False)
+        self._debug_bg_sub2 = cv2.createBackgroundSubtractorMOG2(
+            history=500, varThreshold=48, detectShadows=False)
+        self.btn_bg_mask.setEnabled(True)
         if self._debug_model is not None:
             self.lbl_debug_status.setText("● activo")
             self._seek_frame(self.current_frame)
             return
-        # Load model in background
         model_name = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"][
             self.combo_model.currentIndex()]
         self.lbl_debug_status.setText(f"Cargando {model_name}…")
@@ -1409,6 +1456,10 @@ class BasketballEditor(QMainWindow):
         self._dbg_loader.done.connect(self._on_debug_ready)
         self._dbg_loader.failed.connect(self._on_debug_failed)
         self._dbg_loader.start()
+
+    def _toggle_bg_mask(self, checked: bool):
+        self._debug_show_bg = checked
+        self._seek_frame(self.current_frame)
 
     def _on_debug_ready(self, model):
         self._debug_model = model
@@ -1419,40 +1470,49 @@ class BasketballEditor(QMainWindow):
     def _on_debug_failed(self, err: str):
         self._debug_mode = False
         self.btn_debug.setChecked(False)
+        self.btn_bg_mask.setEnabled(False)
         self.lbl_debug_status.setText("")
         QMessageBox.critical(self, "Debug YOLO", f"No se pudo cargar el modelo:\n{err[-400:]}")
 
-    def _annotate_debug(self, frame):
-        """Dibuja detecciones YOLO + color ball sobre una copia del frame."""
+    def _annotate_debug(self, frame, fg_mask=None):
+        """Dibuja detecciones YOLO + color ball + máscara BG sobre una copia del frame."""
         if frame is None or self._debug_model is None:
             return frame
         out = frame.copy()
-        results = self._debug_model(out, classes=[0, 32], conf=0.25, verbose=False)[0]
 
+        # Foreground mask overlay (green) — shows what the BG subtractor considers moving
+        if self._debug_show_bg and fg_mask is not None:
+            green = np.zeros_like(out)
+            green[fg_mask > 127] = (0, 200, 0)
+            out = cv2.addWeighted(out, 0.65, green, 0.35, 0)
+
+        results = self._debug_model(frame, classes=[0, 32], conf=0.25, verbose=False)[0]
         for box in results.boxes:
             cls  = int(box.cls[0])
             conf = float(box.conf[0])
             x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
-            if cls == 0:                                  # persona
+            if cls == 0:
                 col, tag = (0, 220, 0),   f"P {conf:.2f}"
-            else:                                         # balón YOLO
+            else:
                 col, tag = (0, 220, 220), f"BALL {conf:.2f}"
             cv2.rectangle(out, (x1, y1), (x2, y2), col, 2)
             cv2.putText(out, tag, (x1, max(y1 - 4, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
 
-        # Balón por color HSV (naranja)
-        for b in AutoAnalyzeThread._ball_color(frame):
+        # Ball color — pass fg_mask so it matches what the analyzer uses
+        used_fg = fg_mask if self._debug_show_bg else None
+        for b in AutoAnalyzeThread._ball_color(frame, used_fg):
             x1, y1, x2, y2 = (int(v) for v in b)
             cv2.rectangle(out, (x1, y1), (x2, y2), (0, 140, 255), 2)
             cv2.putText(out, "COLOR", (x1, max(y1 - 4, 12)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1, cv2.LINE_AA)
 
-        # Leyenda en esquina superior izquierda
-        for i, (tag, col) in enumerate([
-                ("YOLO persona", (0, 220, 0)),
-                ("YOLO balon",   (0, 220, 220)),
-                ("Color HSV",    (0, 140, 255))]):
+        legend = [("YOLO persona", (0, 220, 0)),
+                  ("YOLO balon",   (0, 220, 220)),
+                  ("Color HSV",    (0, 140, 255))]
+        if self._debug_show_bg:
+            legend.append(("BG movimiento", (0, 200, 0)))
+        for i, (tag, col) in enumerate(legend):
             cv2.putText(out, tag, (6, 16 + i * 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
         return out
