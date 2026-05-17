@@ -688,6 +688,18 @@ class GeneratorThread(QThread):
             else: break
         return cam
 
+    @staticmethod
+    def _detect_encoder():
+        """Devuelve 'h264_nvenc', 'hevc_nvenc' o None si no hay NVENC."""
+        try:
+            r = subprocess.run(['ffmpeg', '-encoders'],
+                               capture_output=True, text=True, timeout=5)
+            if 'h264_nvenc' in r.stdout:
+                return 'h264_nvenc'
+        except Exception:
+            pass
+        return None
+
     def run(self):
         try:
             cap1 = cv2.VideoCapture(self.cam1)
@@ -696,18 +708,46 @@ class GeneratorThread(QThread):
             H  = int(cap1.get(cv2.CAP_PROP_FRAME_HEIGHT))
             W2 = int(cap2.get(cv2.CAP_PROP_FRAME_WIDTH))
             H2 = int(cap2.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            writer = cv2.VideoWriter(
-                self.output, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (W, H))
+
+            # ── encoder: NVENC si disponible, mp4v como fallback ─────────────
+            nvenc = self._detect_encoder()
+            if nvenc:
+                enc_cmd = [
+                    'ffmpeg', '-y', '-loglevel', 'error',
+                    '-f', 'rawvideo', '-pix_fmt', 'bgr24',
+                    '-s', f'{W}x{H}', '-r', str(self.fps),
+                    '-i', 'pipe:0',
+                    '-c:v', nvenc,
+                    '-preset', 'p4',   # balance velocidad/calidad
+                    '-cq', '23',       # calidad constante (0–51, menor = mejor)
+                    '-pix_fmt', 'yuv420p',
+                    self.output
+                ]
+                enc_proc = subprocess.Popen(enc_cmd, stdin=subprocess.PIPE,
+                                            stderr=subprocess.DEVNULL)
+                def _write(frame):
+                    enc_proc.stdin.write(frame.tobytes())
+                def _close():
+                    enc_proc.stdin.close()
+                    enc_proc.wait()
+                print(f"[INFO] Encoder: {nvenc}", flush=True)
+            else:
+                writer = cv2.VideoWriter(
+                    self.output, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (W, H))
+                def _write(frame):
+                    writer.write(frame)
+                def _close():
+                    writer.release()
+                print("[INFO] Encoder: mp4v (software)", flush=True)
 
             # Pre-seek cam2 to its aligned starting position
             off = self.cam2_offset_frames
             if off > 0:
                 cap2.set(cv2.CAP_PROP_POS_FRAMES, off)
             elif off < 0:
-                # cam1 is behind: skip the first |off| cam1 frames
                 cap1.set(cv2.CAP_PROP_POS_FRAMES, -off)
 
-            prev_cam2_n = off - 1   # track last cam2 frame read
+            prev_cam2_n = off - 1
 
             for n in range(self.total):
                 if self._abort:
@@ -718,7 +758,6 @@ class GeneratorThread(QThread):
 
                 ok1, f1 = cap1.read()
 
-                # Cam2: read sequentially; seek only when discontinuous
                 cam2_n = n + off
                 cam2_n = max(0, min(cam2_n, self.total_frames2 - 1))
                 if cam2_n != prev_cam2_n + 1:
@@ -730,11 +769,12 @@ class GeneratorThread(QThread):
                 if frame is not None:
                     if active == 2 and (W2 != W or H2 != H):
                         frame = cv2.resize(frame, (W, H))
-                    writer.write(frame)
+                    _write(frame)
                 if n % 120 == 0:
                     self.progress.emit(n, self.total)
 
-            cap1.release(); cap2.release(); writer.release()
+            cap1.release(); cap2.release()
+            _close()
             if not self._abort:
                 self.done.emit(self.output)
         except Exception as e:
