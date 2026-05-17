@@ -317,7 +317,7 @@ class SyncThread(QThread):
     status = pyqtSignal(str)
 
     SR           = 16000  # 16 kHz captures referee whistle band (2–7 kHz) fully
-    MAX_SYNC_SEC = 90     # first 90 s — enough whistles, avoids repetitive crowd noise
+    MAX_SYNC_SEC = 300    # first 5 min — catches tip-off whistle even after long warmup
 
     def __init__(self, cam1: str, cam2: str):
         super().__init__()
@@ -778,15 +778,15 @@ class GeneratorThread(QThread):
     done     = pyqtSignal(str)
     failed   = pyqtSignal(str)
 
-    def __init__(self, cam1, cam2, output, cuts, fps, total,
-                 cam2_offset_frames: int = 0, total_frames2: int = 0,
-                 deleted_ranges=None):
+    def __init__(self, cam1, cam2, output, cuts, fps, fps2, total, total2,
+                 cam2_offset_sec: float = 0.0, deleted_ranges=None):
         super().__init__()
         self.cam1, self.cam2 = cam1, cam2
-        self.output, self.cuts, self.fps, self.total = output, cuts, fps, total
-        self.cam2_offset_frames = cam2_offset_frames
-        self.total_frames2      = total_frames2 or total
-        self.deleted_ranges     = deleted_ranges or []
+        self.output, self.cuts = output, cuts
+        self.fps, self.fps2 = fps, fps2
+        self.total, self.total_frames2 = total, total2
+        self.cam2_offset_sec = cam2_offset_sec
+        self.deleted_ranges  = deleted_ranges or []
         self._abort = False
 
     def abort(self):
@@ -851,29 +851,22 @@ class GeneratorThread(QThread):
                     writer.release()
                 print("[INFO] Encoder: mp4v (software)", flush=True)
 
-            # Pre-seek cam2 to its aligned starting position
-            off = self.cam2_offset_frames
-            if off > 0:
-                cap2.set(cv2.CAP_PROP_POS_FRAMES, off)
-            elif off < 0:
-                cap1.set(cv2.CAP_PROP_POS_FRAMES, -off)
-
-            prev_cam2_n = off - 1
+            prev_cam2_n = -1
 
             for n in range(self.total):
                 if self._abort:
                     break
 
-                cam1_time = (n + max(0, -off)) / self.fps
+                cam1_time = n / self.fps
                 active    = self._active_at(cam1_time)
 
                 ok1, f1 = cap1.read()
 
-                cam2_n = n + off
+                cam2_n = round((cam1_time + self.cam2_offset_sec) * self.fps2)
                 cam2_n = max(0, min(cam2_n, self.total_frames2 - 1))
                 if cam2_n != prev_cam2_n + 1:
                     cap2.set(cv2.CAP_PROP_POS_FRAMES, cam2_n)
-                ok2, f2   = cap2.read()
+                ok2, f2     = cap2.read()
                 prev_cam2_n = cam2_n
 
                 # Saltar frames en rangos borrados
@@ -910,7 +903,8 @@ class BasketballEditor(QMainWindow):
 
         self.cap1 = self.cap2 = None
         self.cam1_path = self.cam2_path = ""
-        self.fps = 30.0
+        self.fps  = 30.0
+        self.fps2 = 30.0
         self.total_frames  = 0
         self.total_frames2 = 0
         self.duration = 0.0
@@ -918,10 +912,9 @@ class BasketballEditor(QMainWindow):
         self.playing = False
         self.cuts = CutList()
         self._gen: GeneratorThread | None = None
-        # Audio sync
-        self.cam2_offset_sec    = 0.0   # cam2 local time = cam1 time + offset
-        self.cam2_offset_frames = 0     # = round(offset_sec * fps)
-        self._last_cam2_frame   = -999  # tracks sequential reading of cap2
+        # Audio sync — cam2_time = cam1_time + cam2_offset_sec
+        self.cam2_offset_sec  = 0.0
+        self._last_cam2_frame = -999  # tracks sequential reading of cap2
         self.deleted_ranges: list[tuple[float, float]] = []
         self._deleted_history: list = []
         self._current_sel: tuple[float, float] | None = None
@@ -1174,16 +1167,18 @@ class BasketballEditor(QMainWindow):
             QMessageBox.critical(self, "Error", "No se pudieron abrir los vídeos.")
             return
 
-        self.fps           = self.cap1.get(cv2.CAP_PROP_FPS) or 30.0
+        self.fps  = self.cap1.get(cv2.CAP_PROP_FPS) or 30.0
+        self.fps2 = self.cap2.get(cv2.CAP_PROP_FPS) or self.fps
         self.total_frames  = int(self.cap1.get(cv2.CAP_PROP_FRAME_COUNT))
         self.total_frames2 = int(self.cap2.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.duration      = min(self.total_frames, self.total_frames2) / self.fps
+        dur1 = self.total_frames  / self.fps
+        dur2 = self.total_frames2 / self.fps2
+        self.duration = min(dur1, dur2)
         self.cuts          = CutList()
         self.current_frame = 0
         # Reset sync y secciones borradas
-        self.cam2_offset_sec    = 0.0
-        self.cam2_offset_frames = 0
-        self._last_cam2_frame   = -999
+        self.cam2_offset_sec  = 0.0   # seconds; cam2_time = cam1_time + offset_sec
+        self._last_cam2_frame = -999
         self.deleted_ranges     = []
         self._deleted_history   = []
         self._current_sel       = None
@@ -1205,8 +1200,8 @@ class BasketballEditor(QMainWindow):
             return
         self.current_frame += 1
 
-        # cam2 frame with offset — read sequentially when possible
-        cam2_n = self.current_frame + self.cam2_offset_frames
+        # cam2 frame aligned by time: cam2_time = cam1_time + offset_sec
+        cam2_n = round((self.current_frame / self.fps + self.cam2_offset_sec) * self.fps2)
         cam2_n = max(0, min(cam2_n, self.total_frames2 - 1))
         if cam2_n != self._last_cam2_frame + 1:
             self.cap2.set(cv2.CAP_PROP_POS_FRAMES, cam2_n)
@@ -1245,7 +1240,7 @@ class BasketballEditor(QMainWindow):
         self.cap1.set(cv2.CAP_PROP_POS_FRAMES, n)
         ok1, f1 = self.cap1.read()
 
-        cam2_n = n + self.cam2_offset_frames
+        cam2_n = round((n / self.fps + self.cam2_offset_sec) * self.fps2)
         cam2_n = max(0, min(cam2_n, self.total_frames2 - 1))
         self.cap2.set(cv2.CAP_PROP_POS_FRAMES, cam2_n)
         ok2, f2 = self.cap2.read()
@@ -1315,17 +1310,18 @@ class BasketballEditor(QMainWindow):
         self._sync_thread.start()
 
     def _on_sync_done(self, offset_sec: float):
-        self.cam2_offset_sec    = offset_sec
-        self.cam2_offset_frames = round(offset_sec * self.fps)
-        self._last_cam2_frame   = -999   # force re-seek on next display
+        self.cam2_offset_sec  = offset_sec
+        self._last_cam2_frame = -999   # force re-seek on next display
 
         sign  = "+" if offset_sec >= 0 else ""
         early = "adelantada" if offset_sec >= 0 else "retrasada"
+        frames2 = round(offset_sec * self.fps2)
+        fps_warn = (f"  ⚠ FPS distintos: CAM1={self.fps:.3f}  CAM2={self.fps2:.3f}"
+                    if abs(self.fps - self.fps2) > 0.05 else "")
         self.lbl_offset.setText(
-            f"Desfase: CAM 2 {sign}{offset_sec:.3f}s ({sign}{self.cam2_offset_frames} frames) "
-            f"— CAM 2 está {early} respecto a CAM 1")
+            f"Desfase: CAM 2 {sign}{offset_sec:.3f}s ({sign}{frames2} frames CAM2) "
+            f"— CAM 2 está {early} respecto a CAM 1{fps_warn}")
         self._set_controls_enabled(True)
-        # Refresh current frame with new offset
         self._seek_frame(self.current_frame)
 
     def _on_sync_failed(self, err: str):
@@ -1526,9 +1522,9 @@ class BasketballEditor(QMainWindow):
 
         self._gen = GeneratorThread(
             self.cam1_path, self.cam2_path, out,
-            self.cuts.cuts, self.fps, self.total_frames,
-            cam2_offset_frames=self.cam2_offset_frames,
-            total_frames2=self.total_frames2,
+            self.cuts.cuts, self.fps, self.fps2,
+            self.total_frames, self.total_frames2,
+            cam2_offset_sec=self.cam2_offset_sec,
             deleted_ranges=self.deleted_ranges)
         self._gen.progress.connect(
             lambda n, t: self._prog.setValue(int(100 * n / t)))
