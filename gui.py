@@ -305,15 +305,19 @@ class SyncThread(QThread):
     cam2 relative to cam1.
 
     Positive offset  → cam2 started EARLIER than cam1
-                       (to align: read cam2 at  t + offset)
+                       (to align: read cam2 at  frame + offset_frames)
     Negative offset  → cam2 started LATER than cam1
-                       (to align: read cam2 at  t + offset, which is < t)
+                       (to align: read cam2 at  frame + offset_frames, which is < frame)
+
+    Sign convention: scipy.correlate peak at lag L means a2 needs shifting +L to match a1,
+    so a2 is L samples EARLIER → offset = -L/SR (positive when cam2 is earlier).
     """
     done   = pyqtSignal(float)   # offset_sec
     failed = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    SR = 8000   # sample rate — low enough to be fast, high enough for accuracy
+    SR          = 8000  # sample rate — low enough to be fast, high enough for accuracy
+    MAX_SYNC_SEC = 90   # only use first N seconds; avoids repetitive crowd-noise false peaks
 
     def __init__(self, cam1: str, cam2: str):
         super().__init__()
@@ -333,8 +337,11 @@ class SyncThread(QThread):
 
             from scipy.signal import correlate
             corr = correlate(a1, a2, mode="full", method="fft")
-            lag  = int(np.argmax(np.abs(corr))) - (len(a2) - 1)
-            offset_sec = lag / self.SR
+            # scipy.correlate(a1,a2): peak at lag L means a2 must shift +L to match a1,
+            # i.e. a2's events appear at index (a2_idx + L) in a1 coordinates →
+            # a2 started L/SR seconds EARLIER. Negate so offset > 0 = cam2 earlier.
+            lag        = int(np.argmax(corr)) - (len(a2) - 1)
+            offset_sec = -lag / self.SR
             self.done.emit(float(offset_sec))
 
         except Exception:
@@ -344,10 +351,11 @@ class SyncThread(QThread):
     def _extract(self, path: str) -> np.ndarray:
         cmd = [
             "ffmpeg", "-y", "-i", path,
-            "-ac", "1",                   # mono
-            "-ar", str(self.SR),          # resample
-            "-f", "f32le",                # raw float32
-            "-vn",                        # no video
+            "-ac", "1",                          # mono
+            "-ar", str(self.SR),                 # resample
+            "-t", str(self.MAX_SYNC_SEC),        # only first N seconds
+            "-f", "f32le",                       # raw float32
+            "-vn",                               # no video
             "pipe:1",
         ]
         r = subprocess.run(cmd, capture_output=True)
