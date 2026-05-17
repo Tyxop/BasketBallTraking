@@ -43,6 +43,19 @@ def _btn(bg, border, hover=""):
 
 # ── helpers ───────────────────────────────────────────────────────────────────
 
+def _merge_ranges(ranges: list) -> list:
+    """Une rangos solapados y los ordena."""
+    if not ranges:
+        return []
+    out = [list(sorted(ranges)[0])]
+    for s, e in sorted(ranges)[1:]:
+        if s <= out[-1][1]:
+            out[-1][1] = max(out[-1][1], e)
+        else:
+            out.append([s, e])
+    return [tuple(r) for r in out]
+
+
 def fmt(s: float) -> str:
     m, sec = divmod(int(max(s, 0)), 60)
     return f"{m:02d}:{sec:02d}"
@@ -116,13 +129,18 @@ class CutList:
 # ── timeline widget ───────────────────────────────────────────────────────────
 
 class TimelineWidget(QWidget):
-    seek_requested = pyqtSignal(float)
+    seek_requested    = pyqtSignal(float)
+    section_selected  = pyqtSignal(float, float)   # (start, end)
 
     def __init__(self):
         super().__init__()
-        self.duration = 1.0
-        self.position = 0.0
+        self.duration     = 1.0
+        self.position     = 0.0
         self.cuts: list[tuple[float, int]] = [(0.0, 1)]
+        self._deleted: list[tuple[float, float]] = []
+        self._select_mode = False
+        self._sel_start: float | None = None
+        self._sel_end:   float | None = None
         self.setMinimumHeight(72)
         self.setMaximumHeight(88)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
@@ -134,27 +152,56 @@ class TimelineWidget(QWidget):
         self.cuts     = cuts
         self.update()
 
+    def set_deleted(self, ranges):
+        self._deleted = list(ranges)
+        self.update()
+
+    def set_select_mode(self, on: bool):
+        self._select_mode = on
+        self._sel_start = self._sel_end = None
+        self.setCursor(Qt.CursorShape.CrossCursor if on
+                       else Qt.CursorShape.PointingHandCursor)
+        self.update()
+
+    def clear_selection(self):
+        self._sel_start = self._sel_end = None
+        self.update()
+
     def _x(self, t: float) -> int:
         return int(t / self.duration * (self.width() - 1))
+
+    def _t_at(self, ev) -> float:
+        t = ev.position().x() / self.width() * self.duration
+        return max(0.0, min(t, self.duration))
 
     def paintEvent(self, _ev):
         p  = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         W, H = self.width(), self.height()
-        BY, BH = 16, 32       # bar Y offset and height
+        BY, BH = 16, 32
 
         # Background
         p.fillRect(0, 0, W, H, QColor(20, 20, 20))
 
         # Colored segments
         for i, (ct, cam) in enumerate(self.cuts):
-            nt   = self.cuts[i + 1][0] if i + 1 < len(self.cuts) else self.duration
-            x1   = self._x(ct)
-            x2   = self._x(nt)
-            col  = C1_COL if cam == 1 else C2_COL
+            nt  = self.cuts[i + 1][0] if i + 1 < len(self.cuts) else self.duration
+            x1  = self._x(ct); x2 = self._x(nt)
+            col = C1_COL if cam == 1 else C2_COL
             p.fillRect(x1, BY, max(x2 - x1, 1), BH, col)
 
-        # Cut-point markers (skip the t=0 one)
+        # Deleted ranges — overlay rojo oscuro + rayas diagonales
+        for ds, de in self._deleted:
+            x1, x2 = self._x(ds), self._x(de)
+            w = max(x2 - x1, 1)
+            p.fillRect(x1, BY, w, BH, QColor(120, 20, 20, 200))
+            p.setPen(QPen(QColor(200, 50, 50, 120), 1))
+            step = 6
+            for xi in range(0, w + BH, step):
+                p.drawLine(x1 + xi, BY, x1 + xi - BH, BY + BH)
+            p.setPen(Qt.PenStyle.NoPen)
+
+        # Cut-point markers
         p.setPen(QPen(QColor(255, 255, 255, 210), 1))
         for ct, _ in self.cuts[1:]:
             x = self._x(ct)
@@ -170,22 +217,27 @@ class TimelineWidget(QWidget):
             p.drawText(x + 2, BY + BH + 16, fmt(t))
             t += step
 
-        # Playhead line
+        # Selección activa — overlay amarillo semitransparente
+        if self._sel_start is not None and self._sel_end is not None:
+            a, b = sorted([self._sel_start, self._sel_end])
+            if b > a:
+                x1, x2 = self._x(a), self._x(b)
+                p.fillRect(x1, BY - 3, max(x2 - x1, 1), BH + 6,
+                           QColor(255, 200, 0, 80))
+                p.setPen(QPen(QColor(255, 200, 0), 2))
+                p.drawRect(x1, BY - 3, max(x2 - x1, 1), BH + 6)
+
+        # Playhead
         px = self._x(self.position)
         p.setPen(QPen(QColor(255, 255, 255), 2))
         p.drawLine(px, BY - 8, px, BY + BH + 8)
-
-        # Playhead triangle at the top
         p.setBrush(QBrush(QColor(255, 255, 255)))
         p.setPen(Qt.PenStyle.NoPen)
-        tri = QPolygon([
-            QPoint(px,     BY + 6),
-            QPoint(px - 6, BY - 2),
-            QPoint(px + 6, BY - 2),
-        ])
-        p.drawPolygon(tri)
+        p.drawPolygon(QPolygon([QPoint(px, BY+6),
+                                QPoint(px-6, BY-2),
+                                QPoint(px+6, BY-2)]))
 
-        # Legend (top-right)
+        # Legend
         p.setFont(QFont("sans-serif", 8))
         for i, (lbl, col) in enumerate([("CAM 1", C1_COL), ("CAM 2", C2_COL)]):
             lx = W - 130 + i * 65
@@ -196,11 +248,24 @@ class TimelineWidget(QWidget):
         p.end()
 
     def mousePressEvent(self, ev):
-        self._emit_seek(ev)
+        if self._select_mode and ev.button() == Qt.MouseButton.LeftButton:
+            self._sel_start = self._sel_end = self._t_at(ev)
+            self.update()
+        else:
+            self._emit_seek(ev)
 
     def mouseMoveEvent(self, ev):
-        if ev.buttons() & Qt.MouseButton.LeftButton:
+        if self._select_mode and ev.buttons() & Qt.MouseButton.LeftButton:
+            self._sel_end = self._t_at(ev)
+            self.update()
+        elif not self._select_mode and ev.buttons() & Qt.MouseButton.LeftButton:
             self._emit_seek(ev)
+
+    def mouseReleaseEvent(self, ev):
+        if self._select_mode and self._sel_start is not None:
+            a, b = sorted([self._sel_start, self._sel_end or self._sel_start])
+            if b - a > 0.1:
+                self.section_selected.emit(a, b)
 
     def _emit_seek(self, ev):
         t = ev.position().x() / self.width() * self.duration
@@ -670,12 +735,14 @@ class GeneratorThread(QThread):
     failed   = pyqtSignal(str)
 
     def __init__(self, cam1, cam2, output, cuts, fps, total,
-                 cam2_offset_frames: int = 0, total_frames2: int = 0):
+                 cam2_offset_frames: int = 0, total_frames2: int = 0,
+                 deleted_ranges=None):
         super().__init__()
         self.cam1, self.cam2 = cam1, cam2
         self.output, self.cuts, self.fps, self.total = output, cuts, fps, total
         self.cam2_offset_frames = cam2_offset_frames
         self.total_frames2      = total_frames2 or total
+        self.deleted_ranges     = deleted_ranges or []
         self._abort = False
 
     def abort(self):
@@ -765,6 +832,12 @@ class GeneratorThread(QThread):
                 ok2, f2   = cap2.read()
                 prev_cam2_n = cam2_n
 
+                # Saltar frames en rangos borrados
+                if any(ds <= cam1_time < de for ds, de in self.deleted_ranges):
+                    if n % 120 == 0:
+                        self.progress.emit(n, self.total)
+                    continue
+
                 frame = f1 if active == 1 else f2
                 if frame is not None:
                     if active == 2 and (W2 != W or H2 != H):
@@ -805,6 +878,9 @@ class BasketballEditor(QMainWindow):
         self.cam2_offset_sec    = 0.0   # cam2 local time = cam1 time + offset
         self.cam2_offset_frames = 0     # = round(offset_sec * fps)
         self._last_cam2_frame   = -999  # tracks sequential reading of cap2
+        self.deleted_ranges: list[tuple[float, float]] = []
+        self._deleted_history: list = []
+        self._current_sel: tuple[float, float] | None = None
 
         self._build_ui()
         self._bind_shortcuts()
@@ -857,6 +933,7 @@ class BasketballEditor(QMainWindow):
         # Timeline
         self.timeline = TimelineWidget()
         self.timeline.seek_requested.connect(self._seek_sec)
+        self.timeline.section_selected.connect(self._on_section_selected)
         vbox.addWidget(self.timeline)
 
         # Playback controls
@@ -907,6 +984,35 @@ class BasketballEditor(QMainWindow):
         row_cut.addStretch()
         row_cut.addWidget(self.lbl_cuts)
         vbox.addLayout(row_cut)
+
+        # Section delete row
+        row_sel = QHBoxLayout()
+        row_sel.setSpacing(8)
+
+        self.btn_select_mode = QPushButton("✂  Seleccionar sección  [ S ]")
+        self.btn_select_mode.setCheckable(True)
+        self.btn_select_mode.clicked.connect(self._toggle_select_mode)
+        self.btn_select_mode.setStyleSheet(_btn("#2a1a00", "#a06000", "#3a2200"))
+
+        self.btn_delete_sel = QPushButton("🗑  Borrar sección  [ Del ]")
+        self.btn_delete_sel.setEnabled(False)
+        self.btn_delete_sel.clicked.connect(self._delete_section)
+        self.btn_delete_sel.setStyleSheet(_btn("#3a0000", "#aa2222", "#4a0000"))
+
+        self.btn_undo_del = QPushButton("↩  Restaurar  [ Ctrl+Shift+Z ]")
+        self.btn_undo_del.setEnabled(False)
+        self.btn_undo_del.clicked.connect(self._undo_delete)
+        self.btn_undo_del.setStyleSheet(_btn("#2a2a2a", "#555", "#383838"))
+
+        self.lbl_sel_info = QLabel("Sin selección")
+        self.lbl_sel_info.setStyleSheet("color:#888;font-size:11px;")
+
+        row_sel.addWidget(self.btn_select_mode)
+        row_sel.addWidget(self.btn_delete_sel)
+        row_sel.addWidget(self.btn_undo_del)
+        row_sel.addStretch()
+        row_sel.addWidget(self.lbl_sel_info)
+        vbox.addLayout(row_sel)
 
         # Auto-analyze row
         row_auto = QHBoxLayout()
@@ -972,7 +1078,10 @@ class BasketballEditor(QMainWindow):
             ("Left",    lambda: self._step(-1)),
             ("Right",   lambda: self._step(1)),
             ("Shift+Left",  lambda: self._step(-30)),
-            ("Shift+Right", lambda: self._step(30)),
+            ("Shift+Right",   lambda: self._step(30)),
+            ("S",             self._toggle_select_mode_key),
+            ("Delete",        self._delete_section),
+            ("Ctrl+Shift+Z",  self._undo_delete),
         ]:
             QShortcut(QKeySequence(seq), self).activated.connect(fn)
 
@@ -1009,10 +1118,14 @@ class BasketballEditor(QMainWindow):
         self.duration      = min(self.total_frames, self.total_frames2) / self.fps
         self.cuts          = CutList()
         self.current_frame = 0
-        # Reset sync
+        # Reset sync y secciones borradas
         self.cam2_offset_sec    = 0.0
         self.cam2_offset_frames = 0
         self._last_cam2_frame   = -999
+        self.deleted_ranges     = []
+        self._deleted_history   = []
+        self._current_sel       = None
+        self.timeline.set_deleted([])
         self.lbl_offset.setText("Desfase: sin sincronizar  —  pulsa 🔊 para detectar")
         self.slider.setRange(0, int(self.duration * self.fps) - 1)
         self.timer.setInterval(max(1, int(1000 / self.fps)))
@@ -1243,6 +1356,65 @@ class BasketballEditor(QMainWindow):
 
     # ── generate ──────────────────────────────────────────────────────────────
 
+    # ── section delete ────────────────────────────────────────────────────────
+
+    def _toggle_select_mode_key(self):
+        self.btn_select_mode.setChecked(not self.btn_select_mode.isChecked())
+        self._toggle_select_mode(self.btn_select_mode.isChecked())
+
+    def _toggle_select_mode(self, checked: bool):
+        self.timeline.set_select_mode(checked)
+        if checked:
+            self.btn_select_mode.setText("✂  Modo selección: ON  [ S ]")
+            self._current_sel = None
+            self.btn_delete_sel.setEnabled(False)
+            self.lbl_sel_info.setText("Arrastra sobre la línea de tiempo para seleccionar")
+        else:
+            self.btn_select_mode.setText("✂  Seleccionar sección  [ S ]")
+            self.timeline.clear_selection()
+            self._current_sel = None
+            self.btn_delete_sel.setEnabled(False)
+            self.lbl_sel_info.setText("Sin selección")
+
+    def _on_section_selected(self, start: float, end: float):
+        self._current_sel = (start, end)
+        self.btn_delete_sel.setEnabled(True)
+        self.lbl_sel_info.setText(
+            f"Selección: {fmt(start)} → {fmt(end)}  ({end - start:.1f}s)")
+
+    def _delete_section(self):
+        if not self._current_sel:
+            return
+        self._deleted_history.append(list(self.deleted_ranges))
+        a, b = self._current_sel
+        self.deleted_ranges.append((a, b))
+        self.deleted_ranges = _merge_ranges(self.deleted_ranges)
+        self._current_sel = None
+        self.btn_delete_sel.setEnabled(False)
+        self.btn_undo_del.setEnabled(True)
+        n = len(self.deleted_ranges)
+        total_del = sum(e - s for s, e in self.deleted_ranges)
+        self.lbl_sel_info.setText(
+            f"{n} sección(s) borrada(s) — {total_del:.1f}s eliminados del export")
+        self.timeline.set_deleted(self.deleted_ranges)
+        self.timeline.clear_selection()
+        # Desactivar modo selección
+        self.btn_select_mode.setChecked(False)
+        self._toggle_select_mode(False)
+
+    def _undo_delete(self):
+        if self._deleted_history:
+            self.deleted_ranges = self._deleted_history.pop()
+            self.timeline.set_deleted(self.deleted_ranges)
+            self.btn_undo_del.setEnabled(bool(self._deleted_history))
+            if self.deleted_ranges:
+                self.lbl_sel_info.setText(
+                    f"{len(self.deleted_ranges)} sección(s) borrada(s)")
+            else:
+                self.lbl_sel_info.setText("Sin selección")
+
+    # ── generate ──────────────────────────────────────────────────────────────
+
     def _generate(self):
         if self.cap1 is None: return
         out, _ = QFileDialog.getSaveFileName(
@@ -1259,7 +1431,8 @@ class BasketballEditor(QMainWindow):
             self.cam1_path, self.cam2_path, out,
             self.cuts.cuts, self.fps, self.total_frames,
             cam2_offset_frames=self.cam2_offset_frames,
-            total_frames2=self.total_frames2)
+            total_frames2=self.total_frames2,
+            deleted_ranges=self.deleted_ranges)
         self._gen.progress.connect(
             lambda n, t: self._prog.setValue(int(100 * n / t)))
         self._gen.done.connect(self._gen_done)
