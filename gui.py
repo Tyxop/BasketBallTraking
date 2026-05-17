@@ -267,6 +267,67 @@ class SyncThread(QThread):
         return np.frombuffer(r.stdout, dtype=np.float32).copy()
 
 
+# ── fast IoU tracker (replaces DeepSORT, zero GPU overhead) ──────────────────
+
+class _FastTracker:
+    """Greedy IoU tracker (SORT-style). No CNN, ~1 µs per frame."""
+
+    def __init__(self, max_age=30, n_init=3, iou_thresh=0.3):
+        self.max_age    = max_age
+        self.n_init     = n_init
+        self.iou_thresh = iou_thresh
+        self._tracks    = {}   # tid → {box, hits, age}
+        self._next_id   = 1
+
+    @staticmethod
+    def _iou(a, b):
+        ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+        ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+        inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+        if not inter:
+            return 0.0
+        ua = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+        return inter / (ua + 1e-6)
+
+    def update(self, boxes):
+        """boxes: [[x1,y1,x2,y2], …]. Returns confirmed [(tid, box), …]."""
+        for tid in list(self._tracks):
+            self._tracks[tid]['age'] += 1
+            if self._tracks[tid]['age'] > self.max_age:
+                del self._tracks[tid]
+
+        track_ids = list(self._tracks)
+
+        if boxes and track_ids:
+            tb = [self._tracks[tid]['box'] for tid in track_ids]
+            pairs = sorted(
+                [(self._iou(tb[ti], boxes[di]), ti, di)
+                 for ti in range(len(track_ids))
+                 for di in range(len(boxes))],
+                reverse=True)
+            matched_t, matched_d = set(), set()
+            for iou_val, ti, di in pairs:
+                if iou_val < self.iou_thresh:
+                    break
+                if ti in matched_t or di in matched_d:
+                    continue
+                matched_t.add(ti); matched_d.add(di)
+                tid = track_ids[ti]
+                t   = self._tracks[tid]
+                t['box'] = boxes[di]; t['hits'] += 1; t['age'] = 0
+            for di in range(len(boxes)):
+                if di not in matched_d:
+                    self._tracks[self._next_id] = {'box': boxes[di], 'hits': 1, 'age': 0}
+                    self._next_id += 1
+        else:
+            for box in boxes:
+                self._tracks[self._next_id] = {'box': box, 'hits': 1, 'age': 0}
+                self._next_id += 1
+
+        return [(tid, t['box']) for tid, t in self._tracks.items()
+                if t['hits'] >= self.n_init]
+
+
 # ── auto-analyze thread ───────────────────────────────────────────────────────
 
 class AutoAnalyzeThread(QThread):
@@ -317,37 +378,30 @@ class AutoAnalyzeThread(QThread):
         return boxes
 
     @staticmethod
-    def _score_frame(frame, model, tracker, states):
-        """Returns (score, tracker_states_updated)."""
+    def _score_from_results(yolo_result, frame, tracker, states, precomp_ball=None):
         from collections import deque
         h = frame.shape[0]
-        results = model(frame, classes=[0, 32], conf=0.25, verbose=False)[0]
 
-        person_dets, yolo_balls = [], []
-        for box in results.boxes:
+        person_boxes, yolo_balls = [], []
+        for box in yolo_result.boxes:
             cls  = int(box.cls[0])
             conf = float(box.conf[0])
             x1, y1, x2, y2 = box.xyxy[0].tolist()
             if cls == 32:
                 yolo_balls.append([x1, y1, x2, y2])
             elif cls == 0 and conf >= 0.35:
-                person_dets.append(([x1, y1, x2 - x1, y2 - y1], conf, cls))
+                person_boxes.append([x1, y1, x2, y2])
 
-        ball = (yolo_balls or AutoAnalyzeThread._ball_color(frame))
-        ball = ball[0] if ball else None
+        ball_list = yolo_balls or precomp_ball or []
+        ball = ball_list[0] if ball_list else None
 
-        tracks   = tracker.update_tracks(person_dets, frame=frame)
-        moving   = 0
-        sitting  = 0
-        has_ball = False
+        confirmed = tracker.update(person_boxes)
+        moving    = 0
+        sitting   = 0
+        has_ball  = False
 
-        for track in tracks:
-            if not track.is_confirmed():
-                continue
-            tid = track.track_id
-            x1, y1, x2, y2 = track.to_ltrb()
+        for tid, (x1, y1, x2, y2) in confirmed:
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
-
             if tid not in states:
                 states[tid] = deque(maxlen=15)
             states[tid].append((cx, cy))
@@ -366,15 +420,14 @@ class AutoAnalyzeThread(QThread):
                 moving += 1
 
             if ball:
-                # proximity check
                 bx, by = (ball[0]+ball[2])/2, (ball[1]+ball[3])/2
-                px, py = (x1+x2)/2, (y1+y2)/2
+                px, py = cx, cy
                 if ((bx-px)**2 + (by-py)**2)**0.5 / max(h, 1) < 0.12:
                     has_ball = True
 
         score = 0
-        if ball:        score += 200
-        if has_ball:    score += 300
+        if ball:      score += 200
+        if has_ball:  score += 300
         score += moving  * 30
         score += sitting * 5
         return score
@@ -382,51 +435,132 @@ class AutoAnalyzeThread(QThread):
     def run(self):
         try:
             self.progress.emit(0, 1, "Cargando modelo…")
+            import queue
+            import threading
+            import torch
             from ultralytics import YOLO
-            from deep_sort_realtime.deepsort_tracker import DeepSort
 
-            model   = YOLO(self.model_name)
-            track1  = DeepSort(max_age=30, n_init=3, nn_budget=100)
-            track2  = DeepSort(max_age=30, n_init=3, nn_budget=100)
+            device = "cpu"
+            try:
+                if torch.cuda.is_available():
+                    device = "cuda"
+                    print(f"[INFO] GPU: {torch.cuda.get_device_name(0)}", flush=True)
+                elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+                    device = "mps"
+            except Exception:
+                pass
+
+            model = YOLO(self.model_name)
+            model.to(device)
+
+            half       = (device == "cuda")
+            BATCH_MIN  = 4
+            BATCH_MAX  = 256
+            BATCH_P    = BATCH_MIN
+            QSZ        = BATCH_MAX * 4
+            GPU_TARGET = 0.80
+            dev_label  = device.upper()
+
+            track1 = _FastTracker(max_age=30, n_init=3)
+            track2 = _FastTracker(max_age=30, n_init=3)
             states1: dict = {}
             states2: dict = {}
 
-            cap1  = cv2.VideoCapture(self.cam1)
-            cap2  = cv2.VideoCapture(self.cam2)
+            # Decodificación hardware (NVDEC vía MSMF en Windows) con fallback
+            def _open(path):
+                cap = cv2.VideoCapture(path, cv2.CAP_MSMF)
+                return cap if cap.isOpened() else cv2.VideoCapture(path)
+
+            cap1  = _open(self.cam1)
+            cap2  = _open(self.cam2)
             total = self.total // self.skip
             raw   = []
             t0    = time.time()
+            t_gpu = 0.0   # tiempo acumulado en inferencia GPU
 
-            self.progress.emit(0, total, "Analizando…")
+            # ── dos hilos de decodificación independientes ────────────────────
+            q1: queue.Queue = queue.Queue(maxsize=QSZ)
+            q2: queue.Queue = queue.Queue(maxsize=QSZ)
 
-            idx = 0
-            while idx * self.skip < self.total:
+            def _read_cam(cap, q):
+                idx = 0
+                while idx * self.skip < self.total:
+                    if self._abort:
+                        break
+                    for _ in range(self.skip - 1):
+                        cap.grab()
+                    ok, f = cap.read()
+                    if not ok:
+                        break
+                    q.put(f)
+                    idx += 1
+                q.put(None)
+
+            threading.Thread(target=_read_cam, args=(cap1, q1), daemon=True).start()
+            threading.Thread(target=_read_cam, args=(cap2, q2), daemon=True).start()
+
+            import concurrent.futures
+            N_WORKERS = max(1, (os.cpu_count() or 4) - 2)  # deja 2 cores para decoders
+            ball_pool = concurrent.futures.ThreadPoolExecutor(max_workers=N_WORKERS)
+
+            self.progress.emit(0, total, f"Analizando… [{dev_label}{'  FP16' if half else ''}]")
+
+            buf_f1, buf_f2, idx = [], [], 0
+
+            while True:
                 if self._abort:
-                    cap1.release(); cap2.release()
-                    return
-
-                for _ in range(self.skip - 1):
-                    cap1.grab(); cap2.grab()
-
-                ok1, f1 = cap1.read()
-                ok2, f2 = cap2.read()
-                if not ok1 or not ok2:
                     break
 
-                s1 = self._score_frame(f1, model, track1, states1)
-                s2 = self._score_frame(f2, model, track2, states2)
-                raw.append((s1, s2))
-                idx += 1
+                f1 = q1.get()
+                f2 = q2.get()
+                eof = (f1 is None or f2 is None)
 
-                if idx % 15 == 0:
-                    elapsed  = time.time() - t0
-                    fps_real = idx / max(elapsed, 0.01)
+                if not eof:
+                    buf_f1.append(f1)
+                    buf_f2.append(f2)
+
+                if (len(buf_f1) >= BATCH_P) or (eof and buf_f1):
+                    flat = [f for ab in zip(buf_f1, buf_f2) for f in ab]
+
+                    # _ball_color en paralelo (N_WORKERS cores) solapado con YOLO GPU
+                    ball_futs = [ball_pool.submit(self._ball_color, f) for f in flat]
+
+                    tg = time.perf_counter()
+                    results = model(flat, classes=[0, 32], conf=0.25,
+                                    verbose=False, half=half)
+                    t_gpu += time.perf_counter() - tg
+
+                    balls = [fut.result() for fut in ball_futs]
+
+                    for i in range(len(buf_f1)):
+                        s1 = self._score_from_results(results[i*2],   buf_f1[i], track1, states1, balls[i*2])
+                        s2 = self._score_from_results(results[i*2+1], buf_f2[i], track2, states2, balls[i*2+1])
+                        raw.append((s1, s2))
+                    idx += len(buf_f1)
+                    buf_f1.clear(); buf_f2.clear()
+
+                    # ── ajuste dinámico de batch ──────────────────────────────
+                    t_elapsed = time.time() - t0
+                    if device == "cuda" and t_elapsed > 2.0:
+                        gpu_frac = t_gpu / t_elapsed
+                        if gpu_frac < GPU_TARGET and BATCH_P < BATCH_MAX:
+                            BATCH_P = min(int(BATCH_P * 1.5) + 2, BATCH_MAX)
+                        elif gpu_frac > 0.97 and BATCH_P > BATCH_MIN:
+                            BATCH_P = max(BATCH_P - 1, BATCH_MIN)
+
+                    fps_real = idx / max(t_elapsed, 0.01)
                     eta      = (total - idx) / max(fps_real, 0.01)
+                    gpu_pct  = int(t_gpu / max(t_elapsed, 0.001) * 100)
                     self.progress.emit(
                         idx, total,
-                        f"Analizando… {idx}/{total}  "
-                        f"{fps_real:.1f} fr/s  ETA {eta/60:.1f} min")
+                        f"Analizando… {idx}/{total}  {fps_real:.1f} fr/s  "
+                        f"batch={BATCH_P}  GPU={gpu_pct}%  "
+                        f"ETA {eta/60:.1f} min  [{dev_label}]")
 
+                if eof:
+                    break
+
+            ball_pool.shutdown(wait=False)
             cap1.release(); cap2.release()
 
             if self._abort:
@@ -967,12 +1101,13 @@ class BasketballEditor(QMainWindow):
         total = self.total_frames // skip
         fps   = self.fps
 
-        # Estimate time
-        fps_cpu = 3.0 / skip   # conservative CPU estimate
-        est_min = total / max(fps_cpu, 0.1) / 60
+        # Estimate time (batch = 2 frames per call)
+        fps_gpu = 30.0 / skip   # ~15 pairs/s × 2 frames on RTX 4090
+        fps_cpu =  3.0 / skip   # conservative CPU estimate
+        est_gpu = total / max(fps_gpu, 0.1) / 60
+        est_cpu = total / max(fps_cpu, 0.1) / 60
         self.lbl_auto_status.setText(
-            f"Tiempo estimado: ~{est_min:.0f} min (CPU).  "
-            f"Con GPU puede ser mucho más rápido.")
+            f"Estimado: ~{est_gpu:.0f} min (GPU)  /  ~{est_cpu:.0f} min (CPU)")
 
         self._prog_auto = QProgressDialog(
             "Analizando vídeos…", "Cancelar", 0, total, self)
