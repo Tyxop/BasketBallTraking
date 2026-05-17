@@ -233,21 +233,107 @@ class AutoAnalyzeThread(QThread):
 
     # ── main work ─────────────────────────────────────────────────────────────
 
+    # ── per-frame analysis helpers (inlined to avoid cross-file imports) ────────
+
+    @staticmethod
+    def _ball_color(frame):
+        low  = np.array([5,  120, 120])
+        high = np.array([25, 255, 255])
+        blur = cv2.GaussianBlur(frame, (9, 9), 0)
+        mask = cv2.inRange(cv2.cvtColor(blur, cv2.COLOR_BGR2HSV), low, high)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  np.ones((5, 5), np.uint8))
+        boxes = []
+        for cnt in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+            area = cv2.contourArea(cnt)
+            if not (200 < area < 25000):
+                continue
+            perim = cv2.arcLength(cnt, True)
+            if 4 * np.pi * area / (perim ** 2 + 1e-6) < 0.45:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            boxes.append([float(x), float(y), float(x + w), float(y + h)])
+        return boxes
+
+    @staticmethod
+    def _score_frame(frame, model, tracker, states):
+        """Returns (score, tracker_states_updated)."""
+        from collections import deque
+        h = frame.shape[0]
+        results = model(frame, classes=[0, 32], conf=0.25, verbose=False)[0]
+
+        person_dets, yolo_balls = [], []
+        for box in results.boxes:
+            cls  = int(box.cls[0])
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
+            if cls == 32:
+                yolo_balls.append([x1, y1, x2, y2])
+            elif cls == 0 and conf >= 0.35:
+                person_dets.append(([x1, y1, x2 - x1, y2 - y1], conf, cls))
+
+        ball = (yolo_balls or AutoAnalyzeThread._ball_color(frame))
+        ball = ball[0] if ball else None
+
+        tracks   = tracker.update_tracks(person_dets, frame=frame)
+        moving   = 0
+        sitting  = 0
+        has_ball = False
+
+        for track in tracks:
+            if not track.is_confirmed():
+                continue
+            tid = track.track_id
+            x1, y1, x2, y2 = track.to_ltrb()
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            if tid not in states:
+                states[tid] = deque(maxlen=15)
+            states[tid].append((cx, cy))
+
+            pts = list(states[tid])
+            vel = 0.0
+            if len(pts) >= 2:
+                dx, dy = pts[-1][0] - pts[0][0], pts[-1][1] - pts[0][1]
+                vel = (dx**2 + dy**2)**0.5 / max(len(pts) - 1, 1)
+
+            w = x2 - x1; ht = y2 - y1
+            is_sit = (ht > 0 and w / ht > 0.70) or vel < 3.5
+            if is_sit:
+                sitting += 1
+            else:
+                moving += 1
+
+            if ball:
+                # proximity check
+                bx, by = (ball[0]+ball[2])/2, (ball[1]+ball[3])/2
+                px, py = (x1+x2)/2, (y1+y2)/2
+                if ((bx-px)**2 + (by-py)**2)**0.5 / max(h, 1) < 0.12:
+                    has_ball = True
+
+        score = 0
+        if ball:        score += 200
+        if has_ball:    score += 300
+        score += moving  * 30
+        score += sitting * 5
+        return score
+
     def run(self):
         try:
             self.progress.emit(0, 1, "Cargando modelo…")
-            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-            from analyze import CameraAnalyzer
             from ultralytics import YOLO
+            from deep_sort_realtime.deepsort_tracker import DeepSort
 
-            model = YOLO(self.model_name)
-            a1    = CameraAnalyzer(model)
-            a2    = CameraAnalyzer(model)
+            model   = YOLO(self.model_name)
+            track1  = DeepSort(max_age=30, n_init=3, nn_budget=100)
+            track2  = DeepSort(max_age=30, n_init=3, nn_budget=100)
+            states1: dict = {}
+            states2: dict = {}
 
             cap1  = cv2.VideoCapture(self.cam1)
             cap2  = cv2.VideoCapture(self.cam2)
             total = self.total // self.skip
-            raw   = []          # [(score1, score2)]
+            raw   = []
             t0    = time.time()
 
             self.progress.emit(0, total, "Analizando…")
@@ -266,13 +352,13 @@ class AutoAnalyzeThread(QThread):
                 if not ok1 or not ok2:
                     break
 
-                i1 = a1.analyze(f1)
-                i2 = a2.analyze(f2)
-                raw.append((i1["score"], i2["score"]))
+                s1 = self._score_frame(f1, model, track1, states1)
+                s2 = self._score_frame(f2, model, track2, states2)
+                raw.append((s1, s2))
                 idx += 1
 
                 if idx % 15 == 0:
-                    elapsed = time.time() - t0
+                    elapsed  = time.time() - t0
                     fps_real = idx / max(elapsed, 0.01)
                     eta      = (total - idx) / max(fps_real, 0.01)
                     self.progress.emit(
