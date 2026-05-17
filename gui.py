@@ -891,6 +891,29 @@ class GeneratorThread(QThread):
             self.failed.emit(str(e))
 
 
+# ── debug model loader ────────────────────────────────────────────────────────
+
+class _DebugModelLoader(QThread):
+    done   = pyqtSignal(object)  # YOLO instance
+    failed = pyqtSignal(str)
+
+    def __init__(self, model_name: str):
+        super().__init__()
+        self.model_name = model_name
+
+    def run(self):
+        try:
+            import torch
+            from ultralytics import YOLO
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            m = YOLO(self.model_name)
+            m.to(device)
+            self.done.emit(m)
+        except Exception:
+            import traceback
+            self.failed.emit(traceback.format_exc())
+
+
 # ── main window ───────────────────────────────────────────────────────────────
 
 class BasketballEditor(QMainWindow):
@@ -915,6 +938,11 @@ class BasketballEditor(QMainWindow):
         # Audio sync — cam2_time = cam1_time + cam2_offset_sec
         self.cam2_offset_sec  = 0.0
         self._last_cam2_frame = -999  # tracks sequential reading of cap2
+
+        # Debug YOLO overlay
+        self._debug_mode   = False
+        self._debug_model  = None   # YOLO instance, loaded lazily
+        self._dbg_loader   = None
         self.deleted_ranges: list[tuple[float, float]] = []
         self._deleted_history: list = []
         self._current_sel: tuple[float, float] | None = None
@@ -1096,11 +1124,29 @@ class BasketballEditor(QMainWindow):
         self.lbl_auto_status = QLabel("")
         self.lbl_auto_status.setStyleSheet("color:#888;font-size:11px;")
 
+        self.btn_debug = QPushButton("🎯  Debug YOLO")
+        self.btn_debug.setCheckable(True)
+        self.btn_debug.setToolTip(
+            "Dibuja en tiempo real lo que ve YOLO:\n"
+            "  Verde   — personas detectadas + confianza\n"
+            "  Amarillo — balón (YOLO)\n"
+            "  Naranja  — balón (detector de color HSV)")
+        self.btn_debug.clicked.connect(self._toggle_debug)
+        self.btn_debug.setStyleSheet(
+            _btn("#1a2a1a", "#3a7a2a", "#223322") +
+            "QPushButton:checked{background:#3a7a2a;border:2px solid #6fca4f;}")
+        self.btn_debug.setFixedWidth(140)
+
+        self.lbl_debug_status = QLabel("")
+        self.lbl_debug_status.setStyleSheet("color:#6fca4f;font-size:11px;")
+
         row_auto.addWidget(lbl_auto)
         row_auto.addWidget(self.combo_model)
         row_auto.addWidget(self.combo_skip)
         row_auto.addWidget(self.btn_auto)
         row_auto.addWidget(self.lbl_auto_status, 1)
+        row_auto.addWidget(self.btn_debug)
+        row_auto.addWidget(self.lbl_debug_status)
         vbox.addLayout(row_auto)
 
         # Action buttons
@@ -1143,7 +1189,7 @@ class BasketballEditor(QMainWindow):
     def _set_controls_enabled(self, on: bool):
         for w in (self.btn_play, self.btn_c1, self.btn_c2, self.btn_undo,
                   self.btn_preview, self.btn_gen, self.btn_auto,
-                  self.btn_sync, self.slider):
+                  self.btn_sync, self.btn_debug, self.slider):
             w.setEnabled(on)
 
     # ── loading ───────────────────────────────────────────────────────────────
@@ -1264,7 +1310,10 @@ class BasketballEditor(QMainWindow):
         # Time
         self.lbl_time.setText(f"{fmt(t)} / {fmt(self.duration)}")
 
-        # Frames
+        # Frames (annotate with YOLO debug overlay if active)
+        if self._debug_mode and self._debug_model is not None:
+            f1 = self._annotate_debug(f1)
+            f2 = self._annotate_debug(f2)
         self.pnl1.show_frame(f1, active == 1)
         self.pnl2.show_frame(f2, active == 2)
 
@@ -1329,6 +1378,74 @@ class BasketballEditor(QMainWindow):
         self._set_controls_enabled(True)
         QMessageBox.critical(self, "Error de sincronización",
                              f"No se pudo calcular el desfase:\n\n{err[-600:]}")
+
+    # ── debug YOLO overlay ───────────────────────────────────────────────────
+
+    def _toggle_debug(self, checked: bool):
+        self._debug_mode = checked
+        if not checked:
+            self.lbl_debug_status.setText("")
+            self._seek_frame(self.current_frame)
+            return
+        if self._debug_model is not None:
+            self.lbl_debug_status.setText("● activo")
+            self._seek_frame(self.current_frame)
+            return
+        # Load model in background
+        model_name = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"][
+            self.combo_model.currentIndex()]
+        self.lbl_debug_status.setText(f"Cargando {model_name}…")
+        self._dbg_loader = _DebugModelLoader(model_name)
+        self._dbg_loader.done.connect(self._on_debug_ready)
+        self._dbg_loader.failed.connect(self._on_debug_failed)
+        self._dbg_loader.start()
+
+    def _on_debug_ready(self, model):
+        self._debug_model = model
+        self.lbl_debug_status.setText("● activo")
+        if self._debug_mode:
+            self._seek_frame(self.current_frame)
+
+    def _on_debug_failed(self, err: str):
+        self._debug_mode = False
+        self.btn_debug.setChecked(False)
+        self.lbl_debug_status.setText("")
+        QMessageBox.critical(self, "Debug YOLO", f"No se pudo cargar el modelo:\n{err[-400:]}")
+
+    def _annotate_debug(self, frame):
+        """Dibuja detecciones YOLO + color ball sobre una copia del frame."""
+        if frame is None or self._debug_model is None:
+            return frame
+        out = frame.copy()
+        results = self._debug_model(out, classes=[0, 32], conf=0.25, verbose=False)[0]
+
+        for box in results.boxes:
+            cls  = int(box.cls[0])
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = (int(v) for v in box.xyxy[0].tolist())
+            if cls == 0:                                  # persona
+                col, tag = (0, 220, 0),   f"P {conf:.2f}"
+            else:                                         # balón YOLO
+                col, tag = (0, 220, 220), f"BALL {conf:.2f}"
+            cv2.rectangle(out, (x1, y1), (x2, y2), col, 2)
+            cv2.putText(out, tag, (x1, max(y1 - 4, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, col, 1, cv2.LINE_AA)
+
+        # Balón por color HSV (naranja)
+        for b in AutoAnalyzeThread._ball_color(frame):
+            x1, y1, x2, y2 = (int(v) for v in b)
+            cv2.rectangle(out, (x1, y1), (x2, y2), (0, 140, 255), 2)
+            cv2.putText(out, "COLOR", (x1, max(y1 - 4, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 140, 255), 1, cv2.LINE_AA)
+
+        # Leyenda en esquina superior izquierda
+        for i, (tag, col) in enumerate([
+                ("YOLO persona", (0, 220, 0)),
+                ("YOLO balon",   (0, 220, 220)),
+                ("Color HSV",    (0, 140, 255))]):
+            cv2.putText(out, tag, (6, 16 + i * 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, col, 1, cv2.LINE_AA)
+        return out
 
     # ── auto-analyze ─────────────────────────────────────────────────────────
 
