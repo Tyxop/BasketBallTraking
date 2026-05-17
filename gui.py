@@ -125,6 +125,30 @@ class CutList:
         """User-visible number of transitions (not counting the initial one)."""
         return len(self._cuts) - 1
 
+    def set_range(self, start: float, end: float, cam: int):
+        """Asigna una cámara a todo el rango [start, end]."""
+        self._history.append(list(self._cuts))
+        cam_after = self.active_at(end)          # guardar antes de modificar
+        # Eliminar cortes dentro del rango (excepto t=0)
+        self._cuts = [(t, c) for t, c in self._cuts
+                      if t == 0.0 or not (start <= t <= end)]
+        # Poner la cámara al inicio del rango
+        if start < 0.3:
+            self._cuts[0] = (0.0, cam)
+        else:
+            bisect.insort(self._cuts, (start, cam))
+        # Restaurar la cámara original al final del rango
+        if cam_after != cam:
+            bisect.insort(self._cuts, (end, cam_after))
+        self._collapse()
+
+    def clear_range(self, start: float, end: float):
+        """Elimina todos los puntos de corte dentro de (start, end)."""
+        self._history.append(list(self._cuts))
+        self._cuts = [(t, c) for t, c in self._cuts
+                      if t == 0.0 or not (start < t < end)]
+        self._collapse()
+
 
 # ── timeline widget ───────────────────────────────────────────────────────────
 
@@ -994,6 +1018,21 @@ class BasketballEditor(QMainWindow):
         self.btn_select_mode.clicked.connect(self._toggle_select_mode)
         self.btn_select_mode.setStyleSheet(_btn("#2a1a00", "#a06000", "#3a2200"))
 
+        self.btn_range_cam1 = QPushButton("→ CAM 1")
+        self.btn_range_cam1.setEnabled(False)
+        self.btn_range_cam1.clicked.connect(lambda: self._assign_range(1))
+        self.btn_range_cam1.setStyleSheet(_btn("#12304a", C1_HEX, "#1a4060"))
+
+        self.btn_range_cam2 = QPushButton("→ CAM 2")
+        self.btn_range_cam2.setEnabled(False)
+        self.btn_range_cam2.clicked.connect(lambda: self._assign_range(2))
+        self.btn_range_cam2.setStyleSheet(_btn("#4a2e0a", C2_HEX, "#603a10"))
+
+        self.btn_clear_cuts = QPushButton("✕  Limpiar cortes")
+        self.btn_clear_cuts.setEnabled(False)
+        self.btn_clear_cuts.clicked.connect(self._clear_range_cuts)
+        self.btn_clear_cuts.setStyleSheet(_btn("#2a2a2a", "#777", "#383838"))
+
         self.btn_delete_sel = QPushButton("🗑  Borrar sección  [ Del ]")
         self.btn_delete_sel.setEnabled(False)
         self.btn_delete_sel.clicked.connect(self._delete_section)
@@ -1008,6 +1047,9 @@ class BasketballEditor(QMainWindow):
         self.lbl_sel_info.setStyleSheet("color:#888;font-size:11px;")
 
         row_sel.addWidget(self.btn_select_mode)
+        row_sel.addWidget(self.btn_range_cam1)
+        row_sel.addWidget(self.btn_range_cam2)
+        row_sel.addWidget(self.btn_clear_cuts)
         row_sel.addWidget(self.btn_delete_sel)
         row_sel.addWidget(self.btn_undo_del)
         row_sel.addStretch()
@@ -1367,20 +1409,55 @@ class BasketballEditor(QMainWindow):
         if checked:
             self.btn_select_mode.setText("✂  Modo selección: ON  [ S ]")
             self._current_sel = None
-            self.btn_delete_sel.setEnabled(False)
+            self._set_sel_buttons(False)
             self.lbl_sel_info.setText("Arrastra sobre la línea de tiempo para seleccionar")
         else:
             self.btn_select_mode.setText("✂  Seleccionar sección  [ S ]")
             self.timeline.clear_selection()
             self._current_sel = None
-            self.btn_delete_sel.setEnabled(False)
+            self._set_sel_buttons(False)
             self.lbl_sel_info.setText("Sin selección")
+
+    def _set_sel_buttons(self, on: bool):
+        for b in (self.btn_range_cam1, self.btn_range_cam2,
+                  self.btn_clear_cuts, self.btn_delete_sel):
+            b.setEnabled(on)
 
     def _on_section_selected(self, start: float, end: float):
         self._current_sel = (start, end)
-        self.btn_delete_sel.setEnabled(True)
+        self._set_sel_buttons(True)
         self.lbl_sel_info.setText(
             f"Selección: {fmt(start)} → {fmt(end)}  ({end - start:.1f}s)")
+
+    def _assign_range(self, cam: int):
+        """Asigna toda la selección a cam 1 o 2."""
+        if not self._current_sel:
+            return
+        a, b = self._current_sel
+        self.cuts.set_range(a, b, cam)
+        self._current_sel = None
+        self._finish_sel_action()
+        self.lbl_sel_info.setText(
+            f"Sección {fmt(a)}–{fmt(b)} asignada a CAM {cam}")
+
+    def _clear_range_cuts(self):
+        """Elimina los cortes internos de la selección."""
+        if not self._current_sel:
+            return
+        a, b = self._current_sel
+        self.cuts.clear_range(a, b)
+        self._current_sel = None
+        self._finish_sel_action()
+        self.lbl_sel_info.setText(
+            f"Cortes eliminados en {fmt(a)}–{fmt(b)}")
+
+    def _finish_sel_action(self):
+        """Refresca UI y desactiva modo selección tras una acción."""
+        t = self.current_frame / self.fps
+        self.timeline.set_state(self.duration, t, self.cuts.cuts)
+        self.lbl_cuts.setText(f"Cortes: {self.cuts.n_cuts()}")
+        self.btn_select_mode.setChecked(False)
+        self._toggle_select_mode(False)
 
     def _delete_section(self):
         if not self._current_sel:
