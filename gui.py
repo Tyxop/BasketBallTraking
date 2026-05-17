@@ -468,8 +468,11 @@ class AutoAnalyzeThread(QThread):
 
     @staticmethod
     def _ball_color(frame):
-        low  = np.array([5,  120, 120])
-        high = np.array([25, 255, 255])
+        # Basketball orange: H 8-22 (16°-44°), high saturation + brightness.
+        # H<8 catches reds/browns; H>22 catches yellows; S/V<150 catches dull surfaces.
+        low  = np.array([8,  150, 150])
+        high = np.array([22, 255, 255])
+        fh   = frame.shape[0]
         blur = cv2.GaussianBlur(frame, (9, 9), 0)
         mask = cv2.inRange(cv2.cvtColor(blur, cv2.COLOR_BGR2HSV), low, high)
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
@@ -477,12 +480,19 @@ class AutoAnalyzeThread(QThread):
         boxes = []
         for cnt in cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
             area = cv2.contourArea(cnt)
-            if not (200 < area < 25000):
+            if not (400 < area < 30000):
                 continue
+            # Must be roughly circular (ball ≈ 0.78; loose blobs < 0.55)
             perim = cv2.arcLength(cnt, True)
-            if 4 * np.pi * area / (perim ** 2 + 1e-6) < 0.45:
+            if 4 * np.pi * area / (perim ** 2 + 1e-6) < 0.58:
                 continue
             x, y, w, h = cv2.boundingRect(cnt)
+            # Reject very elongated regions (ads, banners)
+            if max(w, h) > 1.6 * min(w, h):
+                continue
+            # Reject top 12% of frame: scoreboards, ceiling, overhead banners
+            if (y + h / 2) < 0.12 * fh:
+                continue
             boxes.append([float(x), float(y), float(x + w), float(y + h)])
         return boxes
 

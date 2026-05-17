@@ -26,11 +26,11 @@ CLASS_PERSON = 0
 CLASS_BALL   = 32
 
 # ─── Ball color detector (HSV orange) ─────────────────────────────────────────
-BALL_HSV_LOW         = np.array([5,  120, 120])
-BALL_HSV_HIGH        = np.array([25, 255, 255])
-BALL_MIN_AREA        = 200
-BALL_MAX_AREA        = 25000
-BALL_MIN_CIRCULARITY = 0.45
+BALL_HSV_LOW         = np.array([8,  150, 150])
+BALL_HSV_HIGH        = np.array([22, 255, 255])
+BALL_MIN_AREA        = 400
+BALL_MAX_AREA        = 30000
+BALL_MIN_CIRCULARITY = 0.58
 
 # ─── Motion ───────────────────────────────────────────────────────────────────
 MOTION_HISTORY    = 15
@@ -100,6 +100,7 @@ def _near_ball(pbox, bball, fh) -> bool:
 
 
 def _detect_ball_color(frame) -> list:
+    fh   = frame.shape[0]
     blur = cv2.GaussianBlur(frame, (9,9), 0)
     hsv  = cv2.cvtColor(blur, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, BALL_HSV_LOW, BALL_HSV_HIGH)
@@ -113,6 +114,8 @@ def _detect_ball_color(frame) -> list:
         perim = cv2.arcLength(cnt, True)
         if 4*np.pi*area/(perim**2+1e-6) < BALL_MIN_CIRCULARITY: continue
         x,y,w,h = cv2.boundingRect(cnt)
+        if max(w,h) > 1.6 * min(w,h): continue          # reject elongated shapes
+        if (y + h/2) < 0.12 * fh:     continue          # reject scoreboard/ceiling area
         boxes.append([float(x), float(y), float(x+w), float(y+h)])
     return boxes
 
