@@ -292,7 +292,7 @@ def process(video1: str, video2: str, output: str,
         total=total,
         unit="fr",
         dynamic_ncols=True,
-        file=sys.stderr,
+        file=sys.stdout,
         bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}] {postfix}",
     )
 
@@ -333,7 +333,7 @@ def process(video1: str, video2: str, output: str,
             bar.update(1)
 
     except KeyboardInterrupt:
-        tqdm.write("\n[WARN] Interrupted early — partial output written.")
+        tqdm.write("\n[WARN] Interrupted early — partial output written.", file=sys.stdout)
 
     bar.close()
     cap1.release(); cap2.release(); writer.release()

@@ -15,7 +15,7 @@ set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$DIR"
 
-conda run -n basketball python tracker.py \
+conda run --no-capture-output -n basketball python -u tracker.py \
     --cam1   videos/cam1.mp4 \
     --cam2   videos/cam2.mp4 \
     --output output.mp4 \
