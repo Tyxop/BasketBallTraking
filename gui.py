@@ -466,38 +466,79 @@ class AutoAnalyzeThread(QThread):
             states1: dict = {}
             states2: dict = {}
 
-            # Decodificación hardware (NVDEC vía MSMF en Windows) con fallback
-            def _open(path):
-                cap = cv2.VideoCapture(path, cv2.CAP_MSMF)
-                return cap if cap.isOpened() else cv2.VideoCapture(path)
+            # ── detección de NVDEC ────────────────────────────────────────────
+            use_nvdec = False
+            if device == "cuda":
+                try:
+                    r = subprocess.run(['ffmpeg', '-hwaccels'],
+                                       capture_output=True, text=True, timeout=5)
+                    use_nvdec = 'cuda' in r.stdout
+                except Exception:
+                    pass
+            print(f"[INFO] Decode: {'NVDEC (ffmpeg)' if use_nvdec else 'cv2/MSMF'}", flush=True)
 
-            cap1  = _open(self.cam1)
-            cap2  = _open(self.cam2)
+            # Dimensiones de los vídeos (necesario para leer bytes crudos de ffmpeg)
+            def _wh(path):
+                c = cv2.VideoCapture(path)
+                w, h = int(c.get(cv2.CAP_PROP_FRAME_WIDTH)), int(c.get(cv2.CAP_PROP_FRAME_HEIGHT))
+                c.release(); return w, h
+
+            W1, H1 = _wh(self.cam1)
+            W2, H2 = _wh(self.cam2)
+
             total = self.total // self.skip
             raw   = []
             t0    = time.time()
-            t_gpu = 0.0   # tiempo acumulado en inferencia GPU
+            t_gpu = 0.0
 
-            # ── dos hilos de decodificación independientes ────────────────────
+            # ── hilos de decodificación ───────────────────────────────────────
             q1: queue.Queue = queue.Queue(maxsize=QSZ)
             q2: queue.Queue = queue.Queue(maxsize=QSZ)
 
-            def _read_cam(cap, q):
-                idx = 0
-                while idx * self.skip < self.total:
-                    if self._abort:
-                        break
-                    for _ in range(self.skip - 1):
-                        cap.grab()
-                    ok, f = cap.read()
-                    if not ok:
-                        break
-                    q.put(f)
-                    idx += 1
+            def _ffmpeg_nvdec(path, W, H, q):
+                """Decodifica con NVDEC y envía frames como numpy BGR."""
+                frame_bytes = W * H * 3
+                max_frames  = self.total // self.skip
+                sf = f"select=not(mod(n,{self.skip}))" if self.skip > 1 else "select=1"
+                cmd = ['ffmpeg', '-loglevel', 'error',
+                       '-hwaccel', 'cuda',
+                       '-i', path,
+                       '-vf', sf, '-vsync', '0',
+                       '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-']
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.DEVNULL,
+                                        bufsize=frame_bytes * 4)
+                try:
+                    for _ in range(max_frames):
+                        if self._abort: break
+                        data = proc.stdout.read(frame_bytes)
+                        if len(data) < frame_bytes: break
+                        q.put(np.frombuffer(data, np.uint8).reshape(H, W, 3).copy())
+                finally:
+                    try: proc.kill(); proc.wait()
+                    except Exception: pass
                 q.put(None)
 
-            threading.Thread(target=_read_cam, args=(cap1, q1), daemon=True).start()
-            threading.Thread(target=_read_cam, args=(cap2, q2), daemon=True).start()
+            def _cv2_reader(path, q):
+                """Fallback: decodificación software con cv2 + MSMF."""
+                cap = cv2.VideoCapture(path, cv2.CAP_MSMF)
+                if not cap.isOpened():
+                    cap = cv2.VideoCapture(path)
+                idx = 0
+                while idx * self.skip < self.total and not self._abort:
+                    for _ in range(self.skip - 1): cap.grab()
+                    ok, f = cap.read()
+                    if not ok: break
+                    q.put(f); idx += 1
+                cap.release()
+                q.put(None)
+
+            if use_nvdec:
+                threading.Thread(target=_ffmpeg_nvdec, args=(self.cam1, W1, H1, q1), daemon=True).start()
+                threading.Thread(target=_ffmpeg_nvdec, args=(self.cam2, W2, H2, q2), daemon=True).start()
+            else:
+                threading.Thread(target=_cv2_reader, args=(self.cam1, q1), daemon=True).start()
+                threading.Thread(target=_cv2_reader, args=(self.cam2, q2), daemon=True).start()
 
             import concurrent.futures
             N_WORKERS = max(1, (os.cpu_count() or 4) - 2)  # deja 2 cores para decoders
@@ -561,7 +602,6 @@ class AutoAnalyzeThread(QThread):
                     break
 
             ball_pool.shutdown(wait=False)
-            cap1.release(); cap2.release()
 
             if self._abort:
                 return
