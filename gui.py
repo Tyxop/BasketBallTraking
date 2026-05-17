@@ -316,8 +316,8 @@ class SyncThread(QThread):
     failed = pyqtSignal(str)
     status = pyqtSignal(str)
 
-    SR          = 8000  # sample rate — low enough to be fast, high enough for accuracy
-    MAX_SYNC_SEC = 90   # only use first N seconds; avoids repetitive crowd-noise false peaks
+    SR           = 16000  # 16 kHz captures referee whistle band (2–7 kHz) fully
+    MAX_SYNC_SEC = 90     # first 90 s — enough whistles, avoids repetitive crowd noise
 
     def __init__(self, cam1: str, cam2: str):
         super().__init__()
@@ -329,17 +329,29 @@ class SyncThread(QThread):
             a1 = self._extract(self.cam1)
             self.status.emit("Extrayendo audio de CAM 2…")
             a2 = self._extract(self.cam2)
-            self.status.emit("Calculando correlación…")
+            self.status.emit("Aislando pitidos del árbitro…")
+
+            from scipy.signal import correlate, butter, sosfilt
+
+            # Bandpass 1800–7000 Hz: isolates referee whistle, cuts crowd rumble & speech
+            sos = butter(4, [1800, 7000], btype="bandpass", fs=self.SR, output="sos")
+            a1 = sosfilt(sos, a1)
+            a2 = sosfilt(sos, a2)
+
+            # Envelope of the filtered signal — captures WHEN the whistle fires,
+            # not its phase. Much more robust cross-correlation for transient events.
+            smooth = max(1, self.SR // 200)  # ~5 ms smoothing window
+            a1 = np.convolve(np.abs(a1), np.ones(smooth) / smooth, mode="same")
+            a2 = np.convolve(np.abs(a2), np.ones(smooth) / smooth, mode="same")
 
             # Normalize to unit variance
             a1 = a1 / (np.std(a1) + 1e-9)
             a2 = a2 / (np.std(a2) + 1e-9)
 
-            from scipy.signal import correlate
+            self.status.emit("Calculando correlación…")
             corr = correlate(a1, a2, mode="full", method="fft")
             # scipy.correlate(a1,a2): peak at lag L means a2 must shift +L to match a1,
-            # i.e. a2's events appear at index (a2_idx + L) in a1 coordinates →
-            # a2 started L/SR seconds EARLIER. Negate so offset > 0 = cam2 earlier.
+            # i.e. a2's events are L samples EARLIER. Negate so offset > 0 = cam2 earlier.
             lag        = int(np.argmax(corr)) - (len(a2) - 1)
             offset_sec = -lag / self.SR
             self.done.emit(float(offset_sec))
@@ -351,11 +363,11 @@ class SyncThread(QThread):
     def _extract(self, path: str) -> np.ndarray:
         cmd = [
             "ffmpeg", "-y", "-i", path,
-            "-ac", "1",                          # mono
-            "-ar", str(self.SR),                 # resample
-            "-t", str(self.MAX_SYNC_SEC),        # only first N seconds
-            "-f", "f32le",                       # raw float32
-            "-vn",                               # no video
+            "-ac", "1",                    # mono
+            "-ar", str(self.SR),           # resample to 16 kHz
+            "-t", str(self.MAX_SYNC_SEC),  # first 90 seconds only
+            "-f", "f32le",                 # raw float32
+            "-vn",                         # no video
             "pipe:1",
         ]
         r = subprocess.run(cmd, capture_output=True)
