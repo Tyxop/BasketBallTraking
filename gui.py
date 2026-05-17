@@ -11,6 +11,7 @@ import sys
 import bisect
 import os
 import time
+import subprocess
 from pathlib import Path
 
 import cv2
@@ -204,6 +205,66 @@ class TimelineWidget(QWidget):
     def _emit_seek(self, ev):
         t = ev.position().x() / self.width() * self.duration
         self.seek_requested.emit(max(0.0, min(t, self.duration)))
+
+
+# ── audio sync thread ────────────────────────────────────────────────────────
+
+class SyncThread(QThread):
+    """
+    Extracts mono audio from both videos via ffmpeg, computes the
+    FFT cross-correlation and emits the time offset (seconds) of
+    cam2 relative to cam1.
+
+    Positive offset  → cam2 started EARLIER than cam1
+                       (to align: read cam2 at  t + offset)
+    Negative offset  → cam2 started LATER than cam1
+                       (to align: read cam2 at  t + offset, which is < t)
+    """
+    done   = pyqtSignal(float)   # offset_sec
+    failed = pyqtSignal(str)
+    status = pyqtSignal(str)
+
+    SR = 8000   # sample rate — low enough to be fast, high enough for accuracy
+
+    def __init__(self, cam1: str, cam2: str):
+        super().__init__()
+        self.cam1, self.cam2 = cam1, cam2
+
+    def run(self):
+        try:
+            self.status.emit("Extrayendo audio de CAM 1…")
+            a1 = self._extract(self.cam1)
+            self.status.emit("Extrayendo audio de CAM 2…")
+            a2 = self._extract(self.cam2)
+            self.status.emit("Calculando correlación…")
+
+            # Normalize to unit variance
+            a1 = a1 / (np.std(a1) + 1e-9)
+            a2 = a2 / (np.std(a2) + 1e-9)
+
+            from scipy.signal import correlate
+            corr = correlate(a1, a2, mode="full", method="fft")
+            lag  = int(np.argmax(np.abs(corr))) - (len(a2) - 1)
+            offset_sec = lag / self.SR
+            self.done.emit(float(offset_sec))
+
+        except Exception:
+            import traceback
+            self.failed.emit(traceback.format_exc())
+
+    def _extract(self, path: str) -> np.ndarray:
+        cmd = [
+            "ffmpeg", "-y", "-i", path,
+            "-ac", "1",                   # mono
+            "-ar", str(self.SR),          # resample
+            "-f", "f32le",                # raw float32
+            "-vn",                        # no video
+            "pipe:1",
+        ]
+        r = subprocess.run(cmd, capture_output=True)
+        if r.returncode != 0:
+            raise RuntimeError(r.stderr.decode(errors="replace")[-800:])
+        return np.frombuffer(r.stdout, dtype=np.float32).copy()
 
 
 # ── auto-analyze thread ───────────────────────────────────────────────────────
@@ -434,10 +495,13 @@ class GeneratorThread(QThread):
     done     = pyqtSignal(str)
     failed   = pyqtSignal(str)
 
-    def __init__(self, cam1, cam2, output, cuts, fps, total):
+    def __init__(self, cam1, cam2, output, cuts, fps, total,
+                 cam2_offset_frames: int = 0, total_frames2: int = 0):
         super().__init__()
         self.cam1, self.cam2 = cam1, cam2
         self.output, self.cuts, self.fps, self.total = output, cuts, fps, total
+        self.cam2_offset_frames = cam2_offset_frames
+        self.total_frames2      = total_frames2 or total
         self._abort = False
 
     def abort(self):
@@ -461,15 +525,35 @@ class GeneratorThread(QThread):
             writer = cv2.VideoWriter(
                 self.output, cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (W, H))
 
+            # Pre-seek cam2 to its aligned starting position
+            off = self.cam2_offset_frames
+            if off > 0:
+                cap2.set(cv2.CAP_PROP_POS_FRAMES, off)
+            elif off < 0:
+                # cam1 is behind: skip the first |off| cam1 frames
+                cap1.set(cv2.CAP_PROP_POS_FRAMES, -off)
+
+            prev_cam2_n = off - 1   # track last cam2 frame read
+
             for n in range(self.total):
                 if self._abort:
                     break
+
+                cam1_time = (n + max(0, -off)) / self.fps
+                active    = self._active_at(cam1_time)
+
                 ok1, f1 = cap1.read()
-                ok2, f2 = cap2.read()
-                active = self._active_at(n / self.fps)
-                frame  = f1 if active == 1 else f2
+
+                # Cam2: read sequentially; seek only when discontinuous
+                cam2_n = n + off
+                cam2_n = max(0, min(cam2_n, self.total_frames2 - 1))
+                if cam2_n != prev_cam2_n + 1:
+                    cap2.set(cv2.CAP_PROP_POS_FRAMES, cam2_n)
+                ok2, f2   = cap2.read()
+                prev_cam2_n = cam2_n
+
+                frame = f1 if active == 1 else f2
                 if frame is not None:
-                    # Resize cam2 frames if resolution differs
                     if active == 2 and (W2 != W or H2 != H):
                         frame = cv2.resize(frame, (W, H))
                     writer.write(frame)
@@ -496,12 +580,17 @@ class BasketballEditor(QMainWindow):
         self.cap1 = self.cap2 = None
         self.cam1_path = self.cam2_path = ""
         self.fps = 30.0
-        self.total_frames = 0
+        self.total_frames  = 0
+        self.total_frames2 = 0
         self.duration = 0.0
         self.current_frame = 0
         self.playing = False
         self.cuts = CutList()
         self._gen: GeneratorThread | None = None
+        # Audio sync
+        self.cam2_offset_sec    = 0.0   # cam2 local time = cam1 time + offset
+        self.cam2_offset_frames = 0     # = round(offset_sec * fps)
+        self._last_cam2_frame   = -999  # tracks sequential reading of cap2
 
         self._build_ui()
         self._bind_shortcuts()
@@ -530,6 +619,26 @@ class BasketballEditor(QMainWindow):
         row_vid.addWidget(self.pnl1, 1)
         row_vid.addWidget(self.pnl2, 1)
         vbox.addLayout(row_vid, stretch=5)
+
+        # Sync bar
+        row_sync = QHBoxLayout()
+        row_sync.setSpacing(10)
+
+        self.btn_sync = QPushButton("🔊  Sincronizar audio")
+        self.btn_sync.setToolTip(
+            "Extrae el audio de ambas cámaras y calcula el desfase\n"
+            "buscando el mismo pico de sonido (correlación cruzada).")
+        self.btn_sync.clicked.connect(self._sync_audio)
+        self.btn_sync.setStyleSheet(_btn("#1a2a3a", "#4080b0", "#223344"))
+
+        self.lbl_offset = QLabel("Desfase: sin sincronizar")
+        self.lbl_offset.setStyleSheet(
+            "color:#aaa; font-family:monospace; font-size:12px;")
+
+        row_sync.addWidget(self.btn_sync)
+        row_sync.addWidget(self.lbl_offset)
+        row_sync.addStretch()
+        vbox.addLayout(row_sync)
 
         # Timeline
         self.timeline = TimelineWidget()
@@ -655,7 +764,8 @@ class BasketballEditor(QMainWindow):
 
     def _set_controls_enabled(self, on: bool):
         for w in (self.btn_play, self.btn_c1, self.btn_c2, self.btn_undo,
-                  self.btn_preview, self.btn_gen, self.btn_auto, self.slider):
+                  self.btn_preview, self.btn_gen, self.btn_auto,
+                  self.btn_sync, self.slider):
             w.setEnabled(on)
 
     # ── loading ───────────────────────────────────────────────────────────────
@@ -679,13 +789,18 @@ class BasketballEditor(QMainWindow):
             QMessageBox.critical(self, "Error", "No se pudieron abrir los vídeos.")
             return
 
-        self.fps          = self.cap1.get(cv2.CAP_PROP_FPS) or 30.0
-        self.total_frames = min(int(self.cap1.get(cv2.CAP_PROP_FRAME_COUNT)),
-                                int(self.cap2.get(cv2.CAP_PROP_FRAME_COUNT)))
-        self.duration     = self.total_frames / self.fps
-        self.cuts         = CutList()
+        self.fps           = self.cap1.get(cv2.CAP_PROP_FPS) or 30.0
+        self.total_frames  = int(self.cap1.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.total_frames2 = int(self.cap2.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.duration      = min(self.total_frames, self.total_frames2) / self.fps
+        self.cuts          = CutList()
         self.current_frame = 0
-        self.slider.setRange(0, self.total_frames - 1)
+        # Reset sync
+        self.cam2_offset_sec    = 0.0
+        self.cam2_offset_frames = 0
+        self._last_cam2_frame   = -999
+        self.lbl_offset.setText("Desfase: sin sincronizar  —  pulsa 🔊 para detectar")
+        self.slider.setRange(0, int(self.duration * self.fps) - 1)
         self.timer.setInterval(max(1, int(1000 / self.fps)))
         self._set_controls_enabled(True)
         self._seek_frame(0)
@@ -696,11 +811,19 @@ class BasketballEditor(QMainWindow):
 
     def _tick(self):
         ok1, f1 = self.cap1.read()
-        ok2, f2 = self.cap2.read()
-        if not ok1 or not ok2 or self.current_frame >= self.total_frames - 1:
+        if not ok1 or self.current_frame >= self.total_frames - 1:
             self._pause()
             return
         self.current_frame += 1
+
+        # cam2 frame with offset — read sequentially when possible
+        cam2_n = self.current_frame + self.cam2_offset_frames
+        cam2_n = max(0, min(cam2_n, self.total_frames2 - 1))
+        if cam2_n != self._last_cam2_frame + 1:
+            self.cap2.set(cv2.CAP_PROP_POS_FRAMES, cam2_n)
+        ok2, f2 = self.cap2.read()
+        self._last_cam2_frame = cam2_n
+
         self._show(f1, f2)
 
     def _toggle_play(self):
@@ -729,11 +852,16 @@ class BasketballEditor(QMainWindow):
         if self.cap1 is None: return
         n = max(0, min(n, self.total_frames - 1))
         self.current_frame = n
+
         self.cap1.set(cv2.CAP_PROP_POS_FRAMES, n)
-        self.cap2.set(cv2.CAP_PROP_POS_FRAMES, n)
         ok1, f1 = self.cap1.read()
+
+        cam2_n = n + self.cam2_offset_frames
+        cam2_n = max(0, min(cam2_n, self.total_frames2 - 1))
+        self.cap2.set(cv2.CAP_PROP_POS_FRAMES, cam2_n)
         ok2, f2 = self.cap2.read()
-        # caps are now at n+1; next tick reads n+1 correctly
+        self._last_cam2_frame = cam2_n
+
         self._show(f1, f2)
 
     def _slider_moved(self, v: int):
@@ -781,6 +909,41 @@ class BasketballEditor(QMainWindow):
         if self.cap1 is None: return
         self._seek_frame(0)
         self._play()
+
+    # ── audio sync ───────────────────────────────────────────────────────────
+
+    def _sync_audio(self):
+        if self.cap1 is None:
+            return
+        self._pause()
+        self._set_controls_enabled(False)
+        self.lbl_offset.setText("Sincronizando…")
+
+        self._sync_thread = SyncThread(self.cam1_path, self.cam2_path)
+        self._sync_thread.status.connect(self.lbl_offset.setText)
+        self._sync_thread.done.connect(self._on_sync_done)
+        self._sync_thread.failed.connect(self._on_sync_failed)
+        self._sync_thread.start()
+
+    def _on_sync_done(self, offset_sec: float):
+        self.cam2_offset_sec    = offset_sec
+        self.cam2_offset_frames = round(offset_sec * self.fps)
+        self._last_cam2_frame   = -999   # force re-seek on next display
+
+        sign  = "+" if offset_sec >= 0 else ""
+        early = "adelantada" if offset_sec >= 0 else "retrasada"
+        self.lbl_offset.setText(
+            f"Desfase: CAM 2 {sign}{offset_sec:.3f}s ({sign}{self.cam2_offset_frames} frames) "
+            f"— CAM 2 está {early} respecto a CAM 1")
+        self._set_controls_enabled(True)
+        # Refresh current frame with new offset
+        self._seek_frame(self.current_frame)
+
+    def _on_sync_failed(self, err: str):
+        self.lbl_offset.setText("✗ Error en sincronización — revisa que ffmpeg esté instalado")
+        self._set_controls_enabled(True)
+        QMessageBox.critical(self, "Error de sincronización",
+                             f"No se pudo calcular el desfase:\n\n{err[-600:]}")
 
     # ── auto-analyze ─────────────────────────────────────────────────────────
 
@@ -879,7 +1042,9 @@ class BasketballEditor(QMainWindow):
 
         self._gen = GeneratorThread(
             self.cam1_path, self.cam2_path, out,
-            self.cuts.cuts, self.fps, self.total_frames)
+            self.cuts.cuts, self.fps, self.total_frames,
+            cam2_offset_frames=self.cam2_offset_frames,
+            total_frames2=self.total_frames2)
         self._gen.progress.connect(
             lambda n, t: self._prog.setValue(int(100 * n / t)))
         self._gen.done.connect(self._gen_done)
