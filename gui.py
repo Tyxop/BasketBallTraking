@@ -9,6 +9,8 @@ Uso:
 
 import sys
 import bisect
+import os
+import time
 from pathlib import Path
 
 import cv2
@@ -19,7 +21,7 @@ from PyQt6.QtGui import (QImage, QPixmap, QPainter, QColor, QPen,
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QPushButton, QSlider, QFileDialog, QProgressDialog,
-    QFrame, QSizePolicy, QMessageBox
+    QFrame, QSizePolicy, QMessageBox, QComboBox
 )
 
 # ── palette ───────────────────────────────────────────────────────────────────
@@ -204,6 +206,141 @@ class TimelineWidget(QWidget):
         self.seek_requested.emit(max(0.0, min(t, self.duration)))
 
 
+# ── auto-analyze thread ───────────────────────────────────────────────────────
+
+class AutoAnalyzeThread(QThread):
+    """
+    Runs YOLO + DeepSORT on both cameras and converts per-frame scores
+    into a list of (time_sec, cam_id) cuts with smoothing + hysteresis.
+    """
+    progress = pyqtSignal(int, int, str)   # current_frame, total, status
+    done     = pyqtSignal(list)            # [(time_sec, cam_id), ...]
+    failed   = pyqtSignal(str)
+
+    def __init__(self, cam1, cam2, fps, total_frames,
+                 model_name="yolov8n.pt", skip=2,
+                 smooth_sec=2.0, min_dur_sec=3.0):
+        super().__init__()
+        self.cam1, self.cam2      = cam1, cam2
+        self.fps, self.total      = fps, total_frames
+        self.model_name, self.skip = model_name, skip
+        self.smooth_sec           = smooth_sec
+        self.min_dur_sec          = min_dur_sec
+        self._abort               = False
+
+    def abort(self):
+        self._abort = True
+
+    # ── main work ─────────────────────────────────────────────────────────────
+
+    def run(self):
+        try:
+            self.progress.emit(0, 1, "Cargando modelo…")
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from analyze import CameraAnalyzer
+            from ultralytics import YOLO
+
+            model = YOLO(self.model_name)
+            a1    = CameraAnalyzer(model)
+            a2    = CameraAnalyzer(model)
+
+            cap1  = cv2.VideoCapture(self.cam1)
+            cap2  = cv2.VideoCapture(self.cam2)
+            total = self.total // self.skip
+            raw   = []          # [(score1, score2)]
+            t0    = time.time()
+
+            self.progress.emit(0, total, "Analizando…")
+
+            idx = 0
+            while idx * self.skip < self.total:
+                if self._abort:
+                    cap1.release(); cap2.release()
+                    return
+
+                for _ in range(self.skip - 1):
+                    cap1.grab(); cap2.grab()
+
+                ok1, f1 = cap1.read()
+                ok2, f2 = cap2.read()
+                if not ok1 or not ok2:
+                    break
+
+                i1 = a1.analyze(f1)
+                i2 = a2.analyze(f2)
+                raw.append((i1["score"], i2["score"]))
+                idx += 1
+
+                if idx % 15 == 0:
+                    elapsed = time.time() - t0
+                    fps_real = idx / max(elapsed, 0.01)
+                    eta      = (total - idx) / max(fps_real, 0.01)
+                    self.progress.emit(
+                        idx, total,
+                        f"Analizando… {idx}/{total}  "
+                        f"{fps_real:.1f} fr/s  ETA {eta/60:.1f} min")
+
+            cap1.release(); cap2.release()
+
+            if self._abort:
+                return
+
+            self.progress.emit(total, total, "Calculando cortes…")
+            cuts = self._scores_to_cuts(raw)
+            self.done.emit(cuts)
+
+        except Exception:
+            import traceback
+            self.failed.emit(traceback.format_exc())
+
+    # ── score → cuts algorithm ────────────────────────────────────────────────
+
+    def _scores_to_cuts(self, raw):
+        n = len(raw)
+        if n == 0:
+            return [(0.0, 1)]
+
+        # Rolling-window smoothing
+        win  = max(1, int(self.smooth_sec  * self.fps / self.skip))
+        minf = max(1, int(self.min_dur_sec * self.fps / self.skip))
+        sm1, sm2 = [], []
+        s1 = s2 = 0.0
+        for i, (a, b) in enumerate(raw):
+            s1 += a; s2 += b
+            if i >= win:
+                s1 -= raw[i - win][0]
+                s2 -= raw[i - win][1]
+            cnt = min(i + 1, win)
+            sm1.append(s1 / cnt)
+            sm2.append(s2 / cnt)
+
+        desired = [1 if sm1[i] >= sm2[i] else 2 for i in range(n)]
+
+        # Hysteresis: only switch after new camera dominates >= minf frames
+        cuts        = [(0.0, desired[0])]
+        current_cam = desired[0]
+        cand_cam    = None
+        cand_count  = 0
+
+        for i in range(1, n):
+            d = desired[i]
+            if d == current_cam:
+                cand_cam = None; cand_count = 0
+            else:
+                if d == cand_cam:
+                    cand_count += 1
+                    if cand_count >= minf:
+                        t = (i - cand_count + 1) * self.skip / self.fps
+                        if cuts[-1][1] != d:
+                            cuts.append((round(t, 2), d))
+                        current_cam = d
+                        cand_cam = None; cand_count = 0
+                else:
+                    cand_cam = d; cand_count = 1
+
+        return cuts
+
+
 # ── background generator ──────────────────────────────────────────────────────
 
 class GeneratorThread(QThread):
@@ -362,6 +499,40 @@ class BasketballEditor(QMainWindow):
         row_cut.addWidget(self.lbl_cuts)
         vbox.addLayout(row_cut)
 
+        # Auto-analyze row
+        row_auto = QHBoxLayout()
+        row_auto.setSpacing(8)
+
+        lbl_auto = QLabel("Análisis automático:")
+        lbl_auto.setStyleSheet("color:#aaa;font-size:12px;")
+
+        self.combo_model = QComboBox()
+        self.combo_model.addItems(["yolov8n  (rápido)", "yolov8s", "yolov8m  (preciso)"])
+        self.combo_model.setStyleSheet(
+            "QComboBox{background:#2a2a2a;color:#ddd;border:1px solid #444;"
+            "border-radius:4px;padding:4px 8px;}"
+            "QComboBox QAbstractItemView{background:#2a2a2a;color:#ddd;}")
+        self.combo_model.setFixedWidth(180)
+
+        self.combo_skip = QComboBox()
+        self.combo_skip.addItems(["skip 2  (recomendado)", "skip 3  (más rápido)", "skip 1  (máx. calidad)"])
+        self.combo_skip.setStyleSheet(self.combo_model.styleSheet())
+        self.combo_skip.setFixedWidth(160)
+
+        self.btn_auto = QPushButton("🔍  Analizar automáticamente")
+        self.btn_auto.clicked.connect(self._auto_analyze)
+        self.btn_auto.setStyleSheet(_btn("#1a1a3a", "#5060c0", "#22226a"))
+
+        self.lbl_auto_status = QLabel("")
+        self.lbl_auto_status.setStyleSheet("color:#888;font-size:11px;")
+
+        row_auto.addWidget(lbl_auto)
+        row_auto.addWidget(self.combo_model)
+        row_auto.addWidget(self.combo_skip)
+        row_auto.addWidget(self.btn_auto)
+        row_auto.addWidget(self.lbl_auto_status, 1)
+        vbox.addLayout(row_auto)
+
         # Action buttons
         row_act = QHBoxLayout()
         self.btn_open = QPushButton("📂  Abrir vídeos")
@@ -397,8 +568,8 @@ class BasketballEditor(QMainWindow):
             QShortcut(QKeySequence(seq), self).activated.connect(fn)
 
     def _set_controls_enabled(self, on: bool):
-        for w in (self.btn_play, self.btn_c1, self.btn_c2,
-                  self.btn_undo, self.btn_preview, self.btn_gen, self.slider):
+        for w in (self.btn_play, self.btn_c1, self.btn_c2, self.btn_undo,
+                  self.btn_preview, self.btn_gen, self.btn_auto, self.slider):
             w.setEnabled(on)
 
     # ── loading ───────────────────────────────────────────────────────────────
@@ -524,6 +695,87 @@ class BasketballEditor(QMainWindow):
         if self.cap1 is None: return
         self._seek_frame(0)
         self._play()
+
+    # ── auto-analyze ─────────────────────────────────────────────────────────
+
+    def _auto_analyze(self):
+        if self.cap1 is None:
+            return
+
+        model_map = {"yolov8n  (rápido)": "yolov8n.pt",
+                     "yolov8s":           "yolov8s.pt",
+                     "yolov8m  (preciso)": "yolov8m.pt"}
+        skip_map  = {"skip 2  (recomendado)": 2,
+                     "skip 3  (más rápido)":  3,
+                     "skip 1  (máx. calidad)": 1}
+        model = model_map[self.combo_model.currentText()]
+        skip  = skip_map[self.combo_skip.currentText()]
+
+        self._pause()
+        self._set_controls_enabled(False)
+        self.lbl_auto_status.setText("Iniciando…")
+
+        total = self.total_frames // skip
+        fps   = self.fps
+
+        # Estimate time
+        fps_cpu = 3.0 / skip   # conservative CPU estimate
+        est_min = total / max(fps_cpu, 0.1) / 60
+        self.lbl_auto_status.setText(
+            f"Tiempo estimado: ~{est_min:.0f} min (CPU).  "
+            f"Con GPU puede ser mucho más rápido.")
+
+        self._prog_auto = QProgressDialog(
+            "Analizando vídeos…", "Cancelar", 0, total, self)
+        self._prog_auto.setWindowTitle("Análisis automático")
+        self._prog_auto.setWindowModality(Qt.WindowModality.WindowModal)
+        self._prog_auto.setMinimumDuration(0)
+        self._prog_auto.setMinimumWidth(480)
+        self._prog_auto.setValue(0)
+
+        self._auto_thread = AutoAnalyzeThread(
+            self.cam1_path, self.cam2_path,
+            fps, self.total_frames, model, skip)
+        self._auto_thread.progress.connect(self._on_auto_progress)
+        self._auto_thread.done.connect(self._on_auto_done)
+        self._auto_thread.failed.connect(self._on_auto_failed)
+        self._prog_auto.canceled.connect(self._auto_thread.abort)
+        self._prog_auto.canceled.connect(
+            lambda: self._set_controls_enabled(True))
+        self._auto_thread.start()
+
+    def _on_auto_progress(self, current, total, msg):
+        if self._prog_auto:
+            self._prog_auto.setValue(current)
+            self._prog_auto.setLabelText(msg)
+        self.lbl_auto_status.setText(msg)
+
+    def _on_auto_done(self, cuts):
+        self._prog_auto.close()
+        # Load cuts into model
+        self.cuts = CutList()
+        for t, cam in cuts:
+            if t == 0.0:
+                self.cuts._cuts[0] = (0.0, cam)
+            else:
+                bisect.insort(self.cuts._cuts, (t, cam))
+        self.cuts._collapse()
+
+        n = self.cuts.n_cuts()
+        self.lbl_auto_status.setText(
+            f"✓ Análisis completo — {n} corte{'s' if n != 1 else ''} detectado{'s' if n != 1 else ''}. "
+            f"Revisa y ajusta manualmente si lo necesitas.")
+        self._set_controls_enabled(True)
+        # Refresh display
+        t = self.current_frame / self.fps
+        self.timeline.set_state(self.duration, t, self.cuts.cuts)
+        self.lbl_cuts.setText(f"Cortes: {n}")
+
+    def _on_auto_failed(self, err):
+        self._prog_auto.close()
+        self._set_controls_enabled(True)
+        self.lbl_auto_status.setText("✗ Error en el análisis.")
+        QMessageBox.critical(self, "Error en análisis", err)
 
     # ── generate ──────────────────────────────────────────────────────────────
 
