@@ -605,20 +605,18 @@ class AutoAnalyzeThread(QThread):
             q2: queue.Queue = queue.Queue(maxsize=QSZ)
 
             def _ffmpeg_nvdec(path, W, H, q):
-                """Decodifica con NVDEC y envía frames como numpy BGR."""
+                """Decodifica con NVDEC (solo skip=1). Sin filtro select — incompatible
+                con hwaccel en muchas versiones de ffmpeg."""
                 frame_bytes = W * H * 3
-                max_frames  = self.total // self.skip
-                sf = f"select=not(mod(n,{self.skip}))" if self.skip > 1 else "select=1"
                 cmd = ['ffmpeg', '-loglevel', 'error',
                        '-hwaccel', 'cuda',
                        '-i', path,
-                       '-vf', sf, '-vsync', '0',
                        '-f', 'rawvideo', '-pix_fmt', 'bgr24', '-']
                 proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                         stderr=subprocess.DEVNULL,
                                         bufsize=frame_bytes * 4)
                 try:
-                    for _ in range(max_frames):
+                    for _ in range(self.total):
                         if self._abort: break
                         data = proc.stdout.read(frame_bytes)
                         if len(data) < frame_bytes: break
@@ -642,7 +640,9 @@ class AutoAnalyzeThread(QThread):
                 cap.release()
                 q.put(None)
 
-            if use_nvdec:
+            # NVDEC only for skip=1 — the select filter is incompatible with
+            # -hwaccel cuda in many ffmpeg builds; cv2 grab() handles skip correctly.
+            if use_nvdec and self.skip == 1:
                 threading.Thread(target=_ffmpeg_nvdec, args=(self.cam1, W1, H1, q1), daemon=True).start()
                 threading.Thread(target=_ffmpeg_nvdec, args=(self.cam2, W2, H2, q2), daemon=True).start()
             else:
@@ -1336,14 +1336,8 @@ class BasketballEditor(QMainWindow):
         if self.cap1 is None:
             return
 
-        model_map = {"yolov8n  (rápido)": "yolov8n.pt",
-                     "yolov8s":           "yolov8s.pt",
-                     "yolov8m  (preciso)": "yolov8m.pt"}
-        skip_map  = {"skip 2  (recomendado)": 2,
-                     "skip 3  (más rápido)":  3,
-                     "skip 1  (máx. calidad)": 1}
-        model = model_map[self.combo_model.currentText()]
-        skip  = skip_map[self.combo_skip.currentText()]
+        model = ["yolov8n.pt", "yolov8s.pt", "yolov8m.pt"][self.combo_model.currentIndex()]
+        skip  = [2, 3, 1][self.combo_skip.currentIndex()]
 
         self._pause()
         self._set_controls_enabled(False)
